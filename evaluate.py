@@ -158,16 +158,14 @@ def main():
     # -------------------------------------------------------------
     # 3. Unaligned Target Evaluation (Random/Zero initialization of read-in)
     # -------------------------------------------------------------
+    aligned_ckpt = torch.load(args.aligned_checkpoint, map_location=device)
+
+    # 3. Unaligned Target Evaluation (Direct Transfer Baseline)
+    if "unaligned_read_in_state" in aligned_ckpt:
+        vae.encoder.read_in.load_state_dict(aligned_ckpt["unaligned_read_in_state"])
     unaligned_latents, unaligned_pred_v, true_v, targets = run_inference(vae, target_test_loader, device)
     r2_unaligned = compute_r2_score(true_v, unaligned_pred_v)
     rmse_unaligned = compute_rmse(true_v, unaligned_pred_v)
-
-    plot_latent_dynamics_3d(
-        unaligned_latents,
-        targets,
-        title=f"Unaligned Target Latents (R^2: {r2_unaligned:.2f}%)",
-        save_path=os.path.join(args.output_dir, "unaligned_latents_3d.png"),
-    )
 
     # -------------------------------------------------------------
     # 4. Aligned Target Evaluation (Load ERDiff adapted read-in layer)

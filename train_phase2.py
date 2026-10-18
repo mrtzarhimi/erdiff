@@ -1,10 +1,3 @@
-"""
-
-Training script for phase 2
-
-train only read in layer of encoder
-"""
-
 import argparse
 import os
 import torch
@@ -12,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from dataloader import get_nhp_dataloaders
-from vae import SequentialVAE
+from vae import SequentialVAE, trajectory_smoothness_loss
 from diffusion import (
     LatentDiffusionModel,
     VPSDEScheduler,
@@ -24,20 +17,44 @@ from decoder_models import compute_r2_score, compute_rmse
 @torch.no_grad()
 def extract_source_latent_bank(vae: SequentialVAE, source_loader, device: torch.device):
     """
-    Precomputes a representative sample of source latent trajectories Z_0^(s)
-    to compute the Sinkhorn Divergence regularizer during target alignment.
+    Extracts clean deterministic source latent trajectories Z_0^(s)
+    for the Sinkhorn Divergence regularizer.
     """
     vae.eval()
     source_latents = []
     for batch in source_loader:
         spikes = batch["spikes"].to(device)
         mu, _ = vae.encoder(spikes)
-        source_latents.append(mu)  # Use deterministic mean trajectory
+        source_latents.append(mu)
     return torch.cat(source_latents, dim=0)
 
 
+def initialize_target_read_in(
+    source_read_in: nn.Linear,
+    n_src_neurons: int,
+    n_tgt_neurons: int,
+    hidden_dim: int,
+    device: torch.device,
+) -> nn.Linear:
+    """
+    Follows Section 3.3: 'During alignment, we first set phi as phi_s and then linear probe phi.'
+    Copies overlapping channel weights from source read_in when neuron counts match or differ.
+    """
+    new_read_in = nn.Linear(n_tgt_neurons, hidden_dim).to(device)
+    with torch.no_grad():
+        new_read_in.bias.copy_(source_read_in.bias)
+        if n_tgt_neurons == n_src_neurons:
+            new_read_in.weight.copy_(source_read_in.weight)
+        else:
+            # Copy overlapping channels and initialize remaining with small scale
+            min_n = min(n_src_neurons, n_tgt_neurons)
+            nn.init.xavier_uniform_(new_read_in.weight, gain=0.5)
+            new_read_in.weight[:, :min_n].copy_(source_read_in.weight[:, :min_n])
+    return new_read_in
+
+
 def train_epoch_phase2(
-    target_encoder: nn.Module,
+    vae: SequentialVAE,
     diffusion_model: LatentDiffusionModel,
     scheduler: VPSDEScheduler,
     target_loader,
@@ -47,40 +64,42 @@ def train_epoch_phase2(
     alpha: float = 0.5,
 ):
     """
-    Phase 2: Test-time maximum likelihood alignment (Algorithm 2).
-    Only the read-in layer of target_encoder is updated.
+    Phase 2: Maximum Likelihood Alignment (Algorithm 2).
+    Keeps frozen recurrent/dropout layers in .eval() mode while tuning read_in.
     """
-    target_encoder.train()
-    diffusion_model.eval()  # Frozen prior
+    vae.eval()              # Disable dropout in frozen GRU and LayerNorm
+    diffusion_model.eval()  # Frozen score network
 
     total_loss = 0.0
     num_source_samples = source_latents_bank.size(0)
 
     for batch in target_loader:
-        target_spikes = batch["spikes"].to(device)  # (batch_size, seq_len, n_tgt_neurons)
+        target_spikes = batch["spikes"].to(device)
         batch_size = target_spikes.size(0)
 
         optimizer.zero_grad()
 
-        # 1. Project target spikes to latent space via adapted encoder
-        mu_t, logvar_t = target_encoder(target_spikes)
-        z_target = target_encoder.reparameterize(mu_t, logvar_t)
+        # 1. Forward pass through encoder using deterministic continuous trajectory mu_t
+        mu_t, _ = vae.encoder(target_spikes)
 
-        # 2. Randomly sample a matching batch of source latents for Sinkhorn regularizer
-        perm = torch.randperm(num_source_samples)[:batch_size]
-        z_source_batch = source_latents_bank[perm].to(device)
+        # 2. Sample matching batch of source latents for Sinkhorn regularizer
+        perm = torch.randperm(num_source_samples, device=device)[:batch_size]
+        z_source_batch = source_latents_bank[perm]
 
-        # 3. Compute joint MLA + Sinkhorn loss (Eq. 28)
-        loss = total_alignment_loss(
+        # 3. Compute MLA + Sinkhorn + Trajectory Smoothness
+        loss_align = total_alignment_loss(
             diffusion_model=diffusion_model,
             scheduler=scheduler,
-            z_target=z_target,
+            z_target=mu_t,
             z_source=z_source_batch,
             alpha=alpha,
         )
+        loss_smooth = trajectory_smoothness_loss(mu_t)
+        loss = loss_align + 0.2 * loss_smooth
 
-        # 4. Backpropagate into target encoder read_in parameters
+        # 4. Update ONLY encoder.read_in
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(vae.encoder.read_in.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
@@ -95,8 +114,7 @@ def evaluate_target_alignment(
     device: torch.device,
 ):
     """
-    Evaluates zero-shot transfer on target domain behavior decoding (R^2 and RMSE).
-    Target behavior kinematics were NEVER seen during alignment.
+    Evaluates zero-shot kinematics decoding on target domain (R^2 and RMSE).
     """
     vae.eval()
     all_preds = []
@@ -106,7 +124,6 @@ def evaluate_target_alignment(
         spikes = batch["spikes"].to(device)
         velocity = batch["velocity"].to(device)
 
-        # Inference: pass through adapted encoder and frozen pre-trained behavior decoder
         mu, _ = vae.encoder(spikes)
         pred_vel = vae.behavior_decoder(mu)
 
@@ -128,26 +145,30 @@ def main():
     parser.add_argument("--target_data_path", type=str, required=True, help="Path to target session .mat file")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins per trial")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size (64 in paper)")
-    parser.add_argument("--lr", type=float, default=0.005, help="Learning rate for linear probing")
-    parser.add_argument("--epochs", type=int, default=150, help="Alignment iterations/epochs")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off parameter weighting Sinkhorn loss")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--lr", type=float, default=0.002, help="Learning rate for linear probing")
+    parser.add_argument("--weight_decay", type=float, default=1e-3, help="L2 regularization on read-in")
+    parser.add_argument("--epochs", type=int, default=150, help="Alignment epochs")
+    parser.add_argument("--augment_mult", type=int, default=3, help="Target data augmentation multiplier")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off weighting Sinkhorn loss")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 1. Load Data
+    # 1. Load Source and Target Data
     src_train_loader, _, n_src_neurons = get_nhp_dataloaders(
         file_path=args.source_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
+        augment_multiplier=1,  # Clean source bank
     )
     tgt_train_loader, tgt_val_loader, n_tgt_neurons = get_nhp_dataloaders(
         file_path=args.target_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
+        augment_multiplier=args.augment_mult,
     )
     print(f"Source neurons: {n_src_neurons} | Target neurons: {n_tgt_neurons}")
 
@@ -173,37 +194,46 @@ def main():
     ).to(device)
     diffusion_model.load_state_dict(checkpoint["dm_state_dict"])
 
-    # 3. Setup Target Alignment (Linear Probing Setup)
-    # Cache source latent representations for the Sinkhorn regularizer
+    # 3. Precompute Source Latent Bank
     print("Pre-computing source domain latent bank...")
     source_latents_bank = extract_source_latent_bank(vae, src_train_loader, device)
 
-    # Freeze entire VAE and Diffusion Model
+    # 4. Initialize Target Read-In from Source Read-In (Warm Start) & Freeze Rest
+    warm_read_in = initialize_target_read_in(
+        source_read_in=vae.encoder.read_in,
+        n_src_neurons=n_src_neurons,
+        n_tgt_neurons=n_tgt_neurons,
+        hidden_dim=hidden_dim,
+        device=device,
+    )
+    vae.encoder.read_in = warm_read_in
     vae.freeze_for_alignment()
+
     for param in diffusion_model.parameters():
         param.requires_grad = False
 
-    # Replace encoder read-in layer to match target domain neuron count
-    vae.encoder.read_in = nn.Linear(n_tgt_neurons, hidden_dim).to(device)
-    vae.encoder.read_in.weight.requires_grad = True
-    vae.encoder.read_in.bias.requires_grad = True
-
-    # Optimizer tunes ONLY the read-in layer
-    alignment_optimizer = optim.Adam(vae.encoder.read_in.parameters(), lr=args.lr)
+    alignment_optimizer = optim.AdamW(
+        vae.encoder.read_in.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     scheduler = VPSDEScheduler()
 
-    # Zero-shot evaluation before alignment
+    # Evaluate Before Alignment (Direct Transfer / Warm-Start Unaligned Baseline)
     pre_r2, pre_rmse = evaluate_target_alignment(vae, tgt_val_loader, device)
     print(f"Target Performance BEFORE Alignment: R^2 = {pre_r2:.2f}% | RMSE = {pre_rmse:.4f}")
 
-    # 4. Phase 2 Alignment Loop (Algorithm 2)
-    best_target_r2 = -float("inf")
+    # Save unaligned state so eval.py can compare exact before vs. after
+    unaligned_read_in_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
+    best_aligned_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
+    best_target_r2 = pre_r2
+
     save_path = os.path.join(args.save_dir, "phase2_aligned_target_model.pt")
 
     print("\nStarting Maximum Likelihood Alignment (Phase 2)...")
     for epoch in range(1, args.epochs + 1):
         align_loss = train_epoch_phase2(
-            target_encoder=vae.encoder,
+            vae=vae,
             diffusion_model=diffusion_model,
             scheduler=scheduler,
             target_loader=tgt_train_loader,
@@ -219,24 +249,27 @@ def main():
             print(
                 f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
                 f"Alignment Loss: {align_loss:.4f} | "
-                f"Target Test R^2: {target_r2:.2f}% | Target RMSE: {target_rmse:.4f}"
+                f"Target Val R^2: {target_r2:6.2f}% | Target RMSE: {target_rmse:.4f}"
             )
 
         if target_r2 > best_target_r2:
             best_target_r2 = target_r2
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "target_read_in_state": vae.encoder.read_in.state_dict(),
-                    "target_n_neurons": n_tgt_neurons,
-                    "best_target_r2": best_target_r2,
-                },
-                save_path,
-            )
+            best_aligned_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
+
+    torch.save(
+        {
+            "unaligned_read_in_state": unaligned_read_in_state,
+            "target_read_in_state": best_aligned_state,
+            "target_n_neurons": n_tgt_neurons,
+            "pre_r2": pre_r2,
+            "best_target_r2": best_target_r2,
+        },
+        save_path,
+    )
 
     print(f"\nAlignment Complete!")
-    print(f"Initial Unaligned R^2: {pre_r2:.2f}%  -->  Aligned R^2: {best_target_r2:.2f}%")
-    print(f"Saved aligned target weights to: {save_path}")
+    print(f"Unaligned R^2: {pre_r2:.2f}%  -->  ERDiff Aligned R^2: {best_target_r2:.2f}%")
+    print(f"Saved aligned target checkpoint to: {save_path}")
 
 
 if __name__ == "__main__":

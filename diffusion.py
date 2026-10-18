@@ -265,33 +265,30 @@ def sinkhorn_loss(
 ) -> torch.Tensor:
     """
     Entropy-regularized Optimal Transport / Sinkhorn Divergence (Equation 27).
-    Penalizes geometric discrepancy between source and target trajectory sets.
+    Normalized by trajectory dimensionality (seq_len * latent_dim) so its scale
+    matches the element-wise mean in mla_loss.
     """
-    # Flatten trials to vectors: (batch_size, seq_len * latent_dim)
-    b_s = z_source.size(0)
+    b_s, l, d = z_source.shape
     b_t = z_target.size(0)
-    x = z_source.view(b_s, -1)
-    y = z_target.view(b_t, -1)
+    x = z_source.reshape(b_s, -1)
+    y = z_target.reshape(b_t, -1)
 
-    # Pairwise squared Euclidean cost matrix: C_ij = ||x_i - y_j||^2
-    cost = torch.cdist(x, y, p=2.0) ** 2
+    # Mean squared Euclidean cost per time-latent element
+    cost = (torch.cdist(x, y, p=2.0) ** 2) / (l * d)
 
-    # Uniform marginal distributions
     mu = torch.full((b_s,), 1.0 / b_s, device=z_source.device)
     nu = torch.full((b_t,), 1.0 / b_t, device=z_target.device)
 
-    # Kernel matrix
+    # Stabilized kernel matrix
     K = torch.exp(-cost / epsilon)
 
     u = torch.ones_like(mu)
     v = torch.ones_like(nu)
 
-    # Sinkhorn iterations
     for _ in range(num_iters):
         u = mu / (torch.matmul(K, v) + 1e-8)
         v = nu / (torch.matmul(K.t(), u) + 1e-8)
 
-    # Optimal transport plan: gamma = diag(u) @ K @ diag(v)
     gamma = u.unsqueeze(1) * K * v.unsqueeze(0)
     loss = torch.sum(gamma * cost)
     return loss
