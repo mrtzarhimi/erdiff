@@ -88,12 +88,13 @@ class ContinuousBehaviorRegressor(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z: (batch, seq_len, latent_dim) -> permute to (batch, latent_dim, seq_len)
+        # z: (batch, seq_len, latent_dim) -> (batch, latent_dim, seq_len)
         z_t = z.permute(0, 2, 1)
         out = self.conv(z_t)
         # Slice off right-side padding to keep it strictly causal
         out = out[:, :, :-(self.kernel_size - 1)]
-        return out.permute(0, 2, 1)
+        # Return contiguous tensor: (batch, seq_len, behavior_dim)
+        return out.permute(0, 2, 1).contiguous()
 
 
 class SequentialVAE(nn.Module):

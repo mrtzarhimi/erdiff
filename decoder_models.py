@@ -123,8 +123,9 @@ def compute_r2_score(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
       R^2 = (1 - SS_res / SS_tot) * 100
     Averaged across behavioral dimensions (vx, vy).
     """
-    y_true_flat = y_true.view(-1, y_true.size(-1))
-    y_pred_flat = y_pred.view(-1, y_pred.size(-1))
+    # Use .reshape instead of .view to handle non-contiguous memory layouts
+    y_true_flat = y_true.reshape(-1, y_true.size(-1))
+    y_pred_flat = y_pred.reshape(-1, y_pred.size(-1))
 
     ss_res = torch.sum((y_true_flat - y_pred_flat) ** 2, dim=0)
     ss_tot = torch.sum((y_true_flat - torch.mean(y_true_flat, dim=0)) ** 2, dim=0)
