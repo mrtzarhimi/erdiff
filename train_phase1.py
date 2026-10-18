@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from dataloader import get_nhp_dataloaders
-from vae import SequentialVAE, poisson_nll_loss, kl_divergence_loss
+from vae import SequentialVAE, poisson_nll_loss, kl_divergence_loss, trajectory_smoothness_loss
 from diffusion import LatentDiffusionModel, VPSDEScheduler, dsm_loss
 from decoder_models import compute_r2_score, compute_rmse
 
@@ -35,25 +35,23 @@ def train_epoch_phase1(
         # -------------------------------------------------------------
         # 1. Update VAE & Ridge Kinematics Decoder
         # -------------------------------------------------------------
+        # 1. Forward pass through VAE (uses stochastic z during train, deterministic mu during eval)
         vae_optimizer.zero_grad()
+        recon_rate, pred_vel, mu, logvar, z = vae(spikes)
 
-        mu, logvar = vae.encoder(spikes)
-        z = vae.encoder.reparameterize(mu, logvar)
-
-        # Poisson spike reconstruction
-        recon_rate = vae.decoder(z)
         loss_rec = poisson_nll_loss(recon_rate, spikes)
         loss_kl = kl_divergence_loss(mu, logvar)
-
-        # Behavioral velocity prediction + Ridge L2 regularization
-        pred_vel = vae.behavior_decoder(mu)
+        loss_smooth = trajectory_smoothness_loss(mu)
         loss_mse = F.mse_loss(pred_vel, velocity) + vae.behavior_decoder.ridge_penalty()
 
-        # Joint ELBO + Behavior loss
-        loss_vae = loss_rec + kl_weight * loss_kl + behavior_weight * loss_mse
+        # Combined loss with continuous trajectory smoothness
+        loss_vae = (
+            loss_rec
+            + kl_weight * loss_kl
+            + 0.5 * loss_smooth
+            + behavior_weight * loss_mse
+        )
         loss_vae.backward()
-
-        # Clip gradients to stabilize recurrent updates
         torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)
         vae_optimizer.step()
 

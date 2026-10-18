@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 
 
 class AddGaussianNoise:
-    """Exact noise transform from yulewang97/ERDiff."""
+    """Proportional Gaussian noise transform from original ERDiff repo."""
     def __init__(self, factor: float = 0.08):
         self.factor = factor
 
@@ -18,10 +18,6 @@ class AddGaussianNoise:
 
 
 class NHPDataset(Dataset):
-    """
-    Applies dynamic Gaussian noise on EVERY forward pass during training,
-    and replicates the small trial set to match the '_aug_' dataset protocol.
-    """
     def __init__(
         self,
         spikes: torch.Tensor,
@@ -47,7 +43,6 @@ class NHPDataset(Dataset):
         vel = self.velocities[base_idx].clone()
         tgt = self.targets[base_idx]
 
-        # Dynamically inject fresh Gaussian noise on every training access
         if self.is_train:
             spk = self.noise_transform(spk)
             spk = torch.clamp(spk, min=0.0)
@@ -62,9 +57,16 @@ class NHPDataset(Dataset):
 def load_nhp_session(
     file_path: str,
     seq_len: int = 39,
-    smooth_sigma: float = 2.0,
-    gocue_offset_bins: int = 5,  # +100ms after go_cue where movement reliably starts
+    smooth_sigma: float = 2.5,
+    neural_lag_bins: int = 4,  # Motor cortex spikes lead hand velocity by ~80ms (4 bins)
 ):
+    """
+    Fixes Smoking Gun 3:
+      1. Identifies exact movement peak / onset inside each trial window so all trials
+         are phase-aligned in continuous time.
+      2. Accounts for the ~80ms (4-bin) biophysical delay between M1 neural spiking
+         and physical hand velocity.
+    """
     data_dict = mat73.loadmat(file_path)
     xds = data_dict["xds"]
 
@@ -72,19 +74,21 @@ def load_nhp_session(
     if raw_spikes.shape[0] < raw_spikes.shape[1]:
         raw_spikes = raw_spikes.T
 
-    # Smooth spikes along temporal axis
+    # Smooth spike trains into continuous firing rate profiles
     if smooth_sigma > 0:
         raw_spikes = scipy.ndimage.gaussian_filter1d(raw_spikes, sigma=smooth_sigma, axis=0)
 
     raw_velocity = np.array(xds["curs_v"], dtype=np.float32)
     if raw_velocity.shape[0] < raw_velocity.shape[1]:
         raw_velocity = raw_velocity.T
+    raw_speed = np.linalg.norm(raw_velocity, axis=1)
 
     time_frame = np.array(xds["time_frame"]).flatten()
     go_cues = np.array(xds.get("trial_gocue_time", xds.get("trial_start_time"))).flatten()
     if np.all(np.isnan(go_cues)):
         go_cues = np.array(xds["trial_start_time"]).flatten()
 
+    trial_end = np.array(xds.get("trial_end_time", go_cues + 1.5)).flatten()
     trial_results = xds.get("trial_result", None)
     target_angles = xds.get("target_dir", None)
     if target_angles is not None:
@@ -94,8 +98,12 @@ def load_nhp_session(
     trials_vel = []
     trials_targets = []
 
-    for i, go_time in enumerate(go_cues):
-        if np.isnan(go_time):
+    half_len = seq_len // 2  # 19 bins before peak speed, 20 bins after
+
+    for i in range(len(go_cues)):
+        t_go = go_cues[i]
+        t_stop = trial_end[i]
+        if np.isnan(t_go) or np.isnan(t_stop):
             continue
 
         if trial_results is not None:
@@ -103,13 +111,30 @@ def load_nhp_session(
             if isinstance(res, str) and res != "R":
                 continue
 
-        # Consistent alignment window: go_cue + fixed reaction offset (100ms)
-        start_idx = np.searchsorted(time_frame, go_time) + gocue_offset_bins
-        end_idx = start_idx + seq_len
+        idx_go = np.searchsorted(time_frame, t_go)
+        idx_stop = np.searchsorted(time_frame, t_stop)
+        if idx_stop <= idx_go + 5:
+            idx_stop = idx_go + seq_len + 10
 
-        if start_idx >= 0 and end_idx <= raw_spikes.shape[0]:
-            trials_spikes.append(raw_spikes[start_idx:end_idx, :])
-            trials_vel.append(raw_velocity[start_idx:end_idx, :])
+        # Find peak velocity bin within the reach window to eliminate reaction-time jitter
+        search_end = min(raw_speed.shape[0], idx_stop)
+        if search_end <= idx_go:
+            continue
+
+        local_peak_offset = np.argmax(raw_speed[idx_go:search_end])
+        peak_idx = idx_go + local_peak_offset
+
+        # Center velocity window around the reach movement
+        vel_start = peak_idx - half_len
+        vel_end = vel_start + seq_len
+
+        # Shift neural window back by `neural_lag_bins` (~80ms) because M1 drives future velocity
+        spk_start = vel_start - neural_lag_bins
+        spk_end = spk_start + seq_len
+
+        if spk_start >= 0 and vel_end <= raw_spikes.shape[0]:
+            trials_spikes.append(raw_spikes[spk_start:spk_end, :])
+            trials_vel.append(raw_velocity[vel_start:vel_end, :])
 
             if target_angles is not None:
                 deg = np.rad2deg(target_angles[i]) % 360
@@ -117,6 +142,9 @@ def load_nhp_session(
             else:
                 direction_class = 0
             trials_targets.append(direction_class)
+
+    if len(trials_spikes) == 0:
+        raise ValueError(f"No valid trials extracted from {file_path}")
 
     x_data = torch.tensor(np.array(trials_spikes), dtype=torch.float32)
     y_data = torch.tensor(np.array(trials_vel), dtype=torch.float32)
@@ -147,10 +175,7 @@ def get_nhp_dataloaders(
     x_val, y_val = x_data[val_idx], y_data[val_idx]
     t_train, t_val = targets[train_idx], targets[val_idx]
 
-    # Z-score standardize both spikes and velocity using training statistics
-    x_mean = x_train.mean(dim=(0, 1), keepdim=True)
-    x_std = x_train.std(dim=(0, 1), keepdim=True) + 1e-6
-
+    # Normalize velocity using training statistics only
     y_mean = y_train.mean(dim=(0, 1), keepdim=True)
     y_std = y_train.std(dim=(0, 1), keepdim=True) + 1e-6
 
