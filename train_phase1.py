@@ -45,13 +45,14 @@ def train_epoch_phase1(
         loss_rec = poisson_nll_loss(recon_rate, spikes)
         loss_kl = kl_divergence_loss(mu, logvar)
 
-        # Behavioral prediction driven by the smooth mean trajectory
         pred_vel = vae.behavior_decoder(mu)
-        loss_mse = F.mse_loss(pred_vel, velocity)
+        loss_mse = F.mse_loss(pred_vel, velocity) + vae.behavior_decoder.ridge_penalty()
 
-        # Joint loss with normalized scaling
+        # Balanced ELBO + Ridge Behavior Loss
         loss_vae = loss_rec + kl_weight * loss_kl + behavior_weight * loss_mse
         loss_vae.backward()
+        # Gradient clipping prevents recurrent spikes
+        torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)
         vae_optimizer.step()
 
         # -------------------------------------------------------------
@@ -106,13 +107,11 @@ def main():
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins")
     parser.add_argument("--latent_dim", type=int, default=8, help="Latent dimensionality")
-    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden state dimension")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--hidden_dim", type=int, default=32, help="Hidden state dimension (32 prevents overfitting)")
     parser.add_argument("--lr", type=float, default=0.005, help="Learning rate")
-    parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
-    parser.add_argument("--augment_mult", type=int, default=5, help="Data augmentation replication factor")
-    parser.add_argument("--kl_weight", type=float, default=1e-3, help="KL loss weight")
-    parser.add_argument("--behavior_weight", type=float, default=10.0, help="Velocity MSE loss weight")
+    parser.add_argument("--weight_decay", type=float, default=1e-3, help="L2 regularization on encoder/decoder")
+    parser.add_argument("--kl_weight", type=float, default=0.05, help="KL weight keeping latent manifold compact")
+    parser.add_argument("--behavior_weight", type=float, default=2.0, help="Velocity MSE weight")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -146,9 +145,9 @@ def main():
 
     scheduler = VPSDEScheduler()
 
-    # 3. Optimizers
-    vae_optimizer = optim.Adam(vae.parameters(), lr=args.lr)
-    dm_optimizer = optim.Adam(diffusion_model.parameters(), lr=args.lr)
+    # 3. Optimizers with L2 Weight Decay
+    vae_optimizer = optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    dm_optimizer = optim.AdamW(diffusion_model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     # 4. Training Loop
     best_val_r2 = -float("inf")

@@ -7,37 +7,43 @@ class SequentialVAEEncoder(nn.Module):
     def __init__(
         self,
         n_neurons: int,
-        hidden_dim: int = 64,
+        hidden_dim: int = 32,
         latent_dim: int = 8,
-        dropout: float = 0.25,
+        dropout: float = 0.4,
     ):
         super().__init__()
         self.read_in = nn.Linear(n_neurons, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
         self.act = nn.ELU()
         self.dropout = nn.Dropout(p=dropout)
 
+        # Bidirectional GRU extracts smooth trajectory states across the 39 bins
         self.rnn = nn.GRU(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=1,
             batch_first=True,
+            bidirectional=True,
         )
 
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.fc_mu = nn.Linear(hidden_dim * 2, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim * 2, latent_dim)
 
     def forward(self, x: torch.Tensor):
-        h = self.dropout(self.act(self.read_in(x)))
+        h = self.read_in(x)
+        h = self.norm(h)
+        h = self.dropout(self.act(h))
+
         rnn_out, _ = self.rnn(h)
         rnn_out = self.dropout(rnn_out)
 
         mu = self.fc_mu(rnn_out)
-        logvar = self.fc_logvar(rnn_out)
-        # Clamp logvar to prevent numerical collapse
-        logvar = torch.clamp(logvar, min=-5.0, max=2.0)
+        logvar = torch.clamp(self.fc_logvar(rnn_out), min=-4.0, max=1.0)
         return mu, logvar
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return mu
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
@@ -47,9 +53,9 @@ class SequentialVAEDecoder(nn.Module):
     def __init__(
         self,
         latent_dim: int = 8,
-        hidden_dim: int = 64,
+        hidden_dim: int = 32,
         n_neurons: int = 96,
-        dropout: float = 0.2,
+        dropout: float = 0.3,
     ):
         super().__init__()
         self.fc_in = nn.Linear(latent_dim, hidden_dim)
@@ -68,33 +74,25 @@ class SequentialVAEDecoder(nn.Module):
         h = self.dropout(self.act(self.fc_in(z)))
         rnn_out, _ = self.rnn(h)
         log_rates = self.read_out(self.dropout(rnn_out))
-        rates = torch.exp(torch.clamp(log_rates, min=-10.0, max=8.0))
+        rates = F.softplus(log_rates) + 1e-6
         return rates
 
 
-class ContinuousBehaviorRegressor(nn.Module):
+class RidgeBehaviorRegressor(nn.Module):
     """
-    Continuous temporal lag decoder (causal 1D convolution over 5 time bins ~100ms).
-    Prevents discrete point-memorization by modeling continuous temporal flow.
+    Exact Ridge Regression linear decoder from the paper (Section 4.2):
+    Maps latent state Z (8-dim) to velocity (2-dim) with strong L2 penalty.
     """
-    def __init__(self, latent_dim: int = 8, behavior_dim: int = 2, kernel_size: int = 5):
+    def __init__(self, latent_dim: int = 8, behavior_dim: int = 2, l2_alpha: float = 0.1):
         super().__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(
-            in_channels=latent_dim,
-            out_channels=behavior_dim,
-            kernel_size=kernel_size,
-            padding=kernel_size - 1,  # causal padding
-        )
+        self.linear = nn.Linear(latent_dim, behavior_dim)
+        self.l2_alpha = l2_alpha
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z: (batch, seq_len, latent_dim) -> (batch, latent_dim, seq_len)
-        z_t = z.permute(0, 2, 1)
-        out = self.conv(z_t)
-        # Slice off right-side padding to keep it strictly causal
-        out = out[:, :, :-(self.kernel_size - 1)]
-        # Return contiguous tensor: (batch, seq_len, behavior_dim)
-        return out.permute(0, 2, 1).contiguous()
+        return self.linear(z)
+
+    def ridge_penalty(self) -> torch.Tensor:
+        return self.l2_alpha * torch.sum(self.linear.weight ** 2)
 
 
 class SequentialVAE(nn.Module):
@@ -102,20 +100,20 @@ class SequentialVAE(nn.Module):
         self,
         n_neurons: int,
         latent_dim: int = 8,
-        hidden_dim: int = 64,
+        hidden_dim: int = 32,
         behavior_dim: int = 2,
-        dropout: float = 0.25,
+        dropout: float = 0.4,
     ):
         super().__init__()
         self.encoder = SequentialVAEEncoder(n_neurons, hidden_dim, latent_dim, dropout)
-        self.decoder = SequentialVAEDecoder(latent_dim, hidden_dim, n_neurons, dropout)
-        self.behavior_decoder = ContinuousBehaviorRegressor(latent_dim, behavior_dim)
+        self.decoder = SequentialVAEDecoder(latent_dim, hidden_dim, n_neurons, dropout=0.3)
+        self.behavior_decoder = RidgeBehaviorRegressor(latent_dim, behavior_dim, l2_alpha=0.1)
 
     def forward(self, x: torch.Tensor):
         mu, logvar = self.encoder(x)
         z = self.encoder.reparameterize(mu, logvar)
         rates = self.decoder(z)
-        pred_vel = self.behavior_decoder(mu)  # Train behavior on clean continuous trajectory
+        pred_vel = self.behavior_decoder(mu)
         return rates, pred_vel, mu, logvar, z
 
     def freeze_for_alignment(self):
