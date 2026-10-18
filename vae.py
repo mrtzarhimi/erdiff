@@ -183,24 +183,20 @@ class SequentialVAE(nn.Module):
 # ==========================================
 # Loss Functions for Source Domain Training
 # ==========================================
-
 def poisson_nll_loss(rate: torch.Tensor, target_spikes: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
-    Negative log-likelihood under Poisson assumption:
-    NLL = sum( rate - target * log(rate + eps) )
+    Normalized Poisson NLL per neuron per bin.
     """
     loss = rate - target_spikes * torch.log(rate + eps)
-    return loss.sum(dim=-1).mean()
-
+    # Average across batch, sequence length, and neuron dimension
+    return loss.mean()
 
 def kl_divergence_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     """
-    Analytic KL divergence between q(z|x) = N(mu, diag(exp(logvar))) and p(z) = N(0, I):
-    KL = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+    Analytic KL divergence averaged over batch and sequence.
     """
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
     return kld.mean()
-
 
 def source_domain_loss(
     recon_rate: torch.Tensor,
@@ -209,15 +205,13 @@ def source_domain_loss(
     true_vel: torch.Tensor,
     mu: torch.Tensor,
     logvar: torch.Tensor,
-    kl_weight: float = 1.0,
-    behavior_weight: float = 1.0,
+    kl_weight: float = 1e-3,        # Scale down KL to avoid posterior collapse
+    behavior_weight: float = 10.0,   # Boost behavior decoder importance
 ) -> torch.Tensor:
-    """
-    Phase 1 joint loss: Poisson NLL + KL Divergence + Kinematics MSE
-    """
     rec_loss = poisson_nll_loss(recon_rate, spikes)
     kl_loss = kl_divergence_loss(mu, logvar)
     mse_loss = F.mse_loss(pred_vel, true_vel)
     
+    # Scale behavior weight so MSE gradients actively shape the latent space
     total_loss = rec_loss + kl_weight * kl_loss + behavior_weight * mse_loss
     return total_loss

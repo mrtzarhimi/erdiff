@@ -10,28 +10,28 @@ from sklearn.linear_model import Ridge
 
 class KinematicsRegressor(nn.Module):
     """
-    Linear/Ridge behavioral decoder mapping latent dynamics Z to cursor velocity (vx, vy).
-    
-    In Phase 1, it is trained cooperatively with the VAE to inject behavioral semantics
-    into the latent manifold. In Phase 2 and inference, it remains frozen.
+    Kinematics decoder using a small temporal receptive field (causal 1D convolution)
+    to account for the neural-to-kinematic delay (~80-100ms).
     """
-    def __init__(self, latent_dim: int = 8, behavior_dim: int = 2, l2_reg: float = 1e-4):
+    def __init__(self, latent_dim: int = 8, behavior_dim: int = 2, kernel_size: int = 5):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.behavior_dim = behavior_dim
-        self.l2_reg = l2_reg
-
-        # Linear mapping: R^d -> R^2 (vx, vy)
-        self.linear = nn.Linear(latent_dim, behavior_dim)
+        # Causal padding = kernel_size - 1
+        self.conv = nn.Conv1d(
+            in_channels=latent_dim,
+            out_channels=behavior_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size - 1
+        )
+        self.kernel_size = kernel_size
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: Latent trajectories of shape (batch_size, seq_len, latent_dim)
-        Returns:
-            v_pred: Predicted velocities of shape (batch_size, seq_len, behavior_dim)
-        """
-        return self.linear(z)
+        # z: (batch, seq_len, latent_dim) -> (batch, latent_dim, seq_len)
+        z_trans = z.permute(0, 2, 1)
+        out = self.conv(z_trans)
+        # Slice off extra padding to maintain causal length
+        out = out[:, :, :-(self.kernel_size - 1)]
+        # Return as (batch, seq_len, behavior_dim)
+        return out.permute(0, 2, 1)
 
     def regularization_loss(self) -> torch.Tensor:
         """Computes L2 penalty on weights corresponding to ridge penalty."""
