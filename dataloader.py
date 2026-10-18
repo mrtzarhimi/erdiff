@@ -4,14 +4,9 @@ import numpy as np
 import scipy.ndimage
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import KFold
 
 
 class AddGaussianNoise:
-    """
-    Proportional Gaussian jitter matching the paper's augmentation strategy.
-    Adds noise scaled to 8% of the signal's standard deviation.
-    """
     def __init__(self, factor: float = 0.08):
         self.factor = factor
 
@@ -22,16 +17,13 @@ class AddGaussianNoise:
 
 
 class NHPDataset(Dataset):
-    """
-    PyTorch Dataset with optional on-the-fly trial augmentation.
-    """
     def __init__(
         self,
         spikes: torch.Tensor,
         velocities: torch.Tensor,
         targets: torch.Tensor,
         is_train: bool = False,
-        augment_multiplier: int = 5,
+        augment_multiplier: int = 3,
         noise_factor: float = 0.08,
     ):
         self.spikes = spikes
@@ -50,7 +42,6 @@ class NHPDataset(Dataset):
         vel = self.velocities[base_idx].clone()
         tgt = self.targets[base_idx]
 
-        # Apply augmentation only to training copies
         if self.is_train and (idx >= self.spikes.shape[0]):
             spk = self.noise_transform(spk)
             spk = torch.clamp(spk, min=0.0)
@@ -62,14 +53,39 @@ class NHPDataset(Dataset):
         }
 
 
+def find_movement_onset(time_frame, raw_speed, t_start, t_end, threshold_ratio=0.15, min_threshold=3.0):
+    """
+    Finds the exact continuous movement onset timestamp between t_start and t_end
+    where hand speed crosses threshold_ratio * peak_speed.
+    """
+    idx_start = np.searchsorted(time_frame, t_start)
+    idx_end = np.searchsorted(time_frame, t_end)
+    if idx_end <= idx_start:
+        return np.nan
+
+    segment_speed = raw_speed[idx_start:idx_end]
+    if len(segment_speed) == 0:
+        return np.nan
+
+    peak_speed = np.max(segment_speed)
+    thresh = max(min_threshold, peak_speed * threshold_ratio)
+
+    cross_indices = np.where(segment_speed >= thresh)[0]
+    if len(cross_indices) == 0:
+        return time_frame[idx_start]
+
+    onset_idx = idx_start + cross_indices[0]
+    return time_frame[onset_idx]
+
+
 def load_nhp_session(
     file_path: str,
     seq_len: int = 39,
     smooth_sigma: float = 2.5,
-    normalize_vel: bool = True,
 ):
     """
-    Loads Chewie_CO .mat sessions aligned to movement onset.
+    Loads session aligned to CONTINUOUS MOVEMENT ONSET rather than variable go-cues.
+    Captures: 6 bins (~120ms) before onset, and 33 bins (~660ms) through reach.
     """
     data_dict = mat73.loadmat(file_path)
     xds = data_dict["xds"]
@@ -78,25 +94,20 @@ def load_nhp_session(
     raw_spikes = np.array(xds["spike_counts"], dtype=np.float32)
     if raw_spikes.shape[0] < raw_spikes.shape[1]:
         raw_spikes = raw_spikes.T
-
     if smooth_sigma > 0:
         raw_spikes = scipy.ndimage.gaussian_filter1d(raw_spikes, sigma=smooth_sigma, axis=0)
 
-    # 2. Kinematics (Cursor Velocity)
+    # 2. Kinematics
     raw_velocity = np.array(xds["curs_v"], dtype=np.float32)
     if raw_velocity.shape[0] < raw_velocity.shape[1]:
         raw_velocity = raw_velocity.T
+    raw_speed = np.linalg.norm(raw_velocity, axis=1)
 
-    # 3. Alignment Events
     time_frame = np.array(xds["time_frame"]).flatten()
-    
-    # Priority: movement onset time > go cue time > trial start
-    align_times = xds.get("trial_movement_time", None)
-    if align_times is None or np.all(np.isnan(align_times)):
-        align_times = xds.get("trial_gocue_time", xds.get("trial_start_time")).flatten()
-    else:
-        align_times = np.array(align_times).flatten()
 
+    # Priority alignment markers
+    trial_gocue = np.array(xds.get("trial_gocue_time", xds.get("trial_start_time"))).flatten()
+    trial_end = np.array(xds.get("trial_end_time", trial_gocue + 1.5)).flatten()
     trial_results = xds.get("trial_result", None)
     target_angles = xds.get("target_dir", None)
     if target_angles is not None:
@@ -106,8 +117,12 @@ def load_nhp_session(
     trials_vel = []
     trials_targets = []
 
-    for i, event_time in enumerate(align_times):
-        if np.isnan(event_time):
+    pre_bins = 6  # ~120ms continuous preparatory phase
+
+    for i in range(len(trial_gocue)):
+        t_go = trial_gocue[i]
+        t_stop = trial_end[i]
+        if np.isnan(t_go) or np.isnan(t_stop):
             continue
 
         if trial_results is not None:
@@ -115,12 +130,16 @@ def load_nhp_session(
             if isinstance(res, str) and res != "R":
                 continue
 
-        # Start 5 bins (~100 ms) before movement onset to capture preparatory neural dynamics
-        center_idx = np.searchsorted(time_frame, event_time)
-        start_idx = max(0, center_idx - 5)
+        # Find continuous movement onset within [t_go, t_stop]
+        t_onset = find_movement_onset(time_frame, raw_speed, t_go, t_stop)
+        if np.isnan(t_onset):
+            continue
+
+        center_idx = np.searchsorted(time_frame, t_onset)
+        start_idx = center_idx - pre_bins
         end_idx = start_idx + seq_len
 
-        if end_idx <= raw_spikes.shape[0]:
+        if start_idx >= 0 and end_idx <= raw_spikes.shape[0]:
             trials_spikes.append(raw_spikes[start_idx:end_idx, :])
             trials_vel.append(raw_velocity[start_idx:end_idx, :])
 
@@ -132,17 +151,11 @@ def load_nhp_session(
             trials_targets.append(direction_class)
 
     if len(trials_spikes) == 0:
-        raise ValueError(f"No valid trials extracted from {file_path}")
+        raise ValueError(f"No valid movement-aligned trials extracted from {file_path}")
 
     x_data = torch.tensor(np.array(trials_spikes), dtype=torch.float32)
     y_data = torch.tensor(np.array(trials_vel), dtype=torch.float32)
     targets = torch.tensor(np.array(trials_targets), dtype=torch.long)
-
-    # Normalize velocity across trials and bins
-    if normalize_vel:
-        y_mean = y_data.mean(dim=(0, 1), keepdim=True)
-        y_std = y_data.std(dim=(0, 1), keepdim=True) + 1e-8
-        y_data = (y_data - y_mean) / y_std
 
     return x_data, y_data, targets
 
@@ -153,7 +166,7 @@ def get_nhp_dataloaders(
     val_ratio: float = 0.2,
     seed: int = 42,
     seq_len: int = 39,
-    augment_multiplier: int = 5,
+    augment_multiplier: int = 3,
 ):
     x_data, y_data, targets = load_nhp_session(file_path=file_path, seq_len=seq_len)
     num_trials = x_data.shape[0]
@@ -165,19 +178,19 @@ def get_nhp_dataloaders(
     val_idx = perm[:val_size]
     train_idx = perm[val_size:]
 
-    train_dataset = NHPDataset(
-        x_data[train_idx],
-        y_data[train_idx],
-        targets[train_idx],
-        is_train=True,
-        augment_multiplier=augment_multiplier,
-    )
-    val_dataset = NHPDataset(
-        x_data[val_idx],
-        y_data[val_idx],
-        targets[val_idx],
-        is_train=False,
-    )
+    x_train, y_train = x_data[train_idx], y_data[train_idx]
+    x_val, y_val = x_data[val_idx], y_data[val_idx]
+    t_train, t_val = targets[train_idx], targets[val_idx]
+
+    # Compute normalization STRICTLY from training set
+    y_mean = y_train.mean(dim=(0, 1), keepdim=True)
+    y_std = y_train.std(dim=(0, 1), keepdim=True) + 1e-8
+
+    y_train = (y_train - y_mean) / y_std
+    y_val = (y_val - y_mean) / y_std
+
+    train_dataset = NHPDataset(x_train, y_train, t_train, is_train=True, augment_multiplier=augment_multiplier)
+    val_dataset = NHPDataset(x_val, y_val, t_val, is_train=False)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
