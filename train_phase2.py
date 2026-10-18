@@ -65,10 +65,10 @@ def train_epoch_phase2(
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
-    Keeps frozen recurrent/dropout layers in .eval() mode while tuning read_in.
     """
-    vae.eval()              # Disable dropout in frozen GRU and LayerNorm
-    diffusion_model.eval()  # Frozen score network
+    vae.eval()                    # Disable dropout in encoder/decoder
+    vae.encoder.rnn.train()       # Required by cuDNN to backprop through frozen GRU into read_in
+    diffusion_model.eval()        # Frozen score network
 
     total_loss = 0.0
     num_source_samples = source_latents_bank.size(0)
