@@ -18,8 +18,8 @@ def train_epoch_phase1(
     vae_optimizer: optim.Optimizer,
     dm_optimizer: optim.Optimizer,
     device: torch.device,
-    kl_weight: float = 1e-3,
-    behavior_weight: float = 10.0,
+    kl_weight: float = 0.05,
+    behavior_weight: float = 2.0,
 ):
     vae.train()
     diffusion_model.train()
@@ -33,38 +33,39 @@ def train_epoch_phase1(
         velocity = batch["velocity"].to(device)
 
         # -------------------------------------------------------------
-        # 1. Update VAE & Kinematics Decoder
+        # 1. Update VAE & Ridge Kinematics Decoder
         # -------------------------------------------------------------
         vae_optimizer.zero_grad()
 
         mu, logvar = vae.encoder(spikes)
         z = vae.encoder.reparameterize(mu, logvar)
 
-        # Poisson spike reconstruction from stochastic sample
+        # Poisson spike reconstruction
         recon_rate = vae.decoder(z)
         loss_rec = poisson_nll_loss(recon_rate, spikes)
         loss_kl = kl_divergence_loss(mu, logvar)
 
+        # Behavioral velocity prediction + Ridge L2 regularization
         pred_vel = vae.behavior_decoder(mu)
         loss_mse = F.mse_loss(pred_vel, velocity) + vae.behavior_decoder.ridge_penalty()
 
-        # Balanced ELBO + Ridge Behavior Loss
+        # Joint ELBO + Behavior loss
         loss_vae = loss_rec + kl_weight * loss_kl + behavior_weight * loss_mse
         loss_vae.backward()
-        # Gradient clipping prevents recurrent spikes
+
+        # Clip gradients to stabilize recurrent updates
         torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)
         vae_optimizer.step()
 
         # -------------------------------------------------------------
         # 2. Cooperative Diffusion Training (Algorithm 1)
-        # Train STBlock denoiser on the learned latent manifold
         # -------------------------------------------------------------
         dm_optimizer.zero_grad()
-        
-        # Use mu directly as the clean spatial-temporal trajectory
+
         z_0 = mu.detach()
         loss_dm = dsm_loss(diffusion_model, scheduler, z_0)
         loss_dm.backward()
+        torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), max_norm=1.0)
         dm_optimizer.step()
 
         total_vae_loss += loss_vae.item()
@@ -105,13 +106,16 @@ def main():
     parser = argparse.ArgumentParser(description="Phase 1: Source Domain Training (ERDiff)")
     parser.add_argument("--data_path", type=str, required=True, help="Path to source session .mat file")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Output directory")
-    parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins")
-    parser.add_argument("--latent_dim", type=int, default=8, help="Latent dimensionality")
-    parser.add_argument("--hidden_dim", type=int, default=32, help="Hidden state dimension (32 prevents overfitting)")
+    parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins per trial")
+    parser.add_argument("--latent_dim", type=int, default=8, help="Latent dynamics dimensionality")
+    parser.add_argument("--hidden_dim", type=int, default=32, help="Hidden state dimension")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=0.005, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=1e-3, help="L2 regularization on encoder/decoder")
-    parser.add_argument("--kl_weight", type=float, default=0.05, help="KL weight keeping latent manifold compact")
-    parser.add_argument("--behavior_weight", type=float, default=2.0, help="Velocity MSE weight")
+    parser.add_argument("--weight_decay", type=float, default=1e-3, help="L2 weight decay regularization")
+    parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+    parser.add_argument("--augment_mult", type=int, default=5, help="Data augmentation replication factor")
+    parser.add_argument("--kl_weight", type=float, default=0.05, help="ELBO KL loss weight")
+    parser.add_argument("--behavior_weight", type=float, default=2.0, help="Velocity MSE loss weight")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -127,12 +131,13 @@ def main():
     )
     print(f"Loaded source domain with {n_neurons} neurons across trials of length {args.seq_len}.")
 
-    # 2. Instantiate Architecture
+    # 2. Instantiate Models
     vae = SequentialVAE(
         n_neurons=n_neurons,
         latent_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
         behavior_dim=2,
+        dropout=0.4,
     ).to(device)
 
     diffusion_model = LatentDiffusionModel(
@@ -149,7 +154,7 @@ def main():
     vae_optimizer = optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     dm_optimizer = optim.AdamW(diffusion_model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    # 4. Training Loop
+    # 4. Cooperative Training Loop
     best_val_r2 = -float("inf")
     save_path = os.path.join(args.save_dir, "phase1_source_models.pt")
 
@@ -172,8 +177,8 @@ def main():
         if epoch % 10 == 0 or epoch == args.epochs:
             print(
                 f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
-                f"Train R^2: {train_r2:5.2f}% | "
-                f"Val R^2: {val_r2:5.2f}% | Val RMSE: {val_rmse:.4f} | "
+                f"Train R^2: {train_r2:6.2f}% | "
+                f"Val R^2: {val_r2:6.2f}% | Val RMSE: {val_rmse:.4f} | "
                 f"DSM Loss: {dm_loss:.4f}"
             )
 
