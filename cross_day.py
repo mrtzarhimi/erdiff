@@ -170,7 +170,7 @@ def main():
 
         # 2. Run Evaluation & Plot Generation
         cmd_eval = [
-            "python", "eval.py",
+            "python", "evaluate_cross_day.py",
             "--source_checkpoint", phase1_ckpt,
             "--aligned_checkpoint", target_ckpt_path,
             "--target_data_path", target_path,
