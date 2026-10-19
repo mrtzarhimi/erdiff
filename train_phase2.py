@@ -29,27 +29,49 @@ def extract_source_latent_bank(vae: SequentialVAE, source_loader, device: torch.
     return torch.cat(source_latents, dim=0)
 
 
+@torch.no_grad()
 def initialize_target_read_in(
     source_read_in: nn.Linear,
+    src_loader,
+    tgt_loader,
     n_src_neurons: int,
     n_tgt_neurons: int,
     hidden_dim: int,
     device: torch.device,
 ) -> nn.Linear:
     """
-    Follows Section 3.3: 'During alignment, we first set phi as phi_s and then linear probe phi.'
-    Copies overlapping channel weights from source read_in when neuron counts match or differ.
+    Initializes target read_in layer.
+    - If neuron counts match, copies source read_in weights directly.
+    - If neuron counts differ (e.g. 96 -> 92 due to dropped electrodes), computes
+      a regularized linear projection mapping target trial-averaged neural profiles
+      onto source hidden activations so target latents start inside the source manifold.
     """
     new_read_in = nn.Linear(n_tgt_neurons, hidden_dim).to(device)
-    with torch.no_grad():
-        new_read_in.bias.copy_(source_read_in.bias)
-        if n_tgt_neurons == n_src_neurons:
-            new_read_in.weight.copy_(source_read_in.weight)
-        else:
-            # Copy overlapping channels and initialize remaining with small scale
-            min_n = min(n_src_neurons, n_tgt_neurons)
-            nn.init.xavier_uniform_(new_read_in.weight, gain=0.5)
-            new_read_in.weight[:, :min_n].copy_(source_read_in.weight[:, :min_n])
+    new_read_in.bias.copy_(source_read_in.bias)
+
+    if n_tgt_neurons == n_src_neurons:
+        new_read_in.weight.copy_(source_read_in.weight)
+        return new_read_in
+
+    # Gather temporal mean profile across training trials: shape (seq_len, n_neurons)
+    src_batches = [b["spikes"].to(device) for b in src_loader]
+    tgt_batches = [b["spikes"].to(device) for b in tgt_loader]
+
+    # Compute mean firing rate trajectory across trials: (seq_len, N)
+    X_src_mean = torch.cat(src_batches, dim=0).mean(dim=0)  # (L, N_src)
+    X_tgt_mean = torch.cat(tgt_batches, dim=0).mean(dim=0)  # (L, N_tgt)
+
+    # Source hidden activations before bias: H_src = X_src_mean @ W_src^T  -> (L, hidden_dim)
+    H_src = torch.matmul(X_src_mean, source_read_in.weight.t())
+
+    # Solve Ridge least squares: X_tgt_mean @ W_tgt^T = H_src
+    # W_tgt^T = (X_tgt^T X_tgt + lambda I)^(-1) X_tgt^T H_src
+    reg = 10.0 * torch.eye(n_tgt_neurons, device=device)
+    A = torch.matmul(X_tgt_mean.t(), X_tgt_mean) + reg
+    B = torch.matmul(X_tgt_mean.t(), H_src)
+    W_tgt_T = torch.linalg.solve(A, B)  # (N_tgt, hidden_dim)
+
+    new_read_in.weight.copy_(W_tgt_T.t())
     return new_read_in
 
 
@@ -198,9 +220,11 @@ def main():
     print("Pre-computing source domain latent bank...")
     source_latents_bank = extract_source_latent_bank(vae, src_train_loader, device)
 
-    # 4. Initialize Target Read-In from Source Read-In (Warm Start) & Freeze Rest
+    # 4. Initialize Target Read-In (handles both equal and mismatched neuron counts)
     warm_read_in = initialize_target_read_in(
         source_read_in=vae.encoder.read_in,
+        src_loader=src_train_loader,
+        tgt_loader=tgt_train_loader,
         n_src_neurons=n_src_neurons,
         n_tgt_neurons=n_tgt_neurons,
         hidden_dim=hidden_dim,

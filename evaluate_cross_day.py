@@ -142,8 +142,12 @@ def main():
     ).to(device)
 
     # Load frozen recurrent & behavior decoder weights from source
+    # Exclude both encoder.read_in and decoder.read_out since neuron counts vary across days
     base_state = src_ckpt["vae_state_dict"]
-    filtered_base_state = {k: v for k, v in base_state.items() if not k.startswith("encoder.read_in")}
+    filtered_base_state = {
+        k: v for k, v in base_state.items()
+        if not k.startswith("encoder.read_in") and not k.startswith("decoder.read_out")
+    }
     vae.load_state_dict(filtered_base_state, strict=False)
 
     # 3. Unaligned Target Evaluation (Direct Transfer Baseline)
