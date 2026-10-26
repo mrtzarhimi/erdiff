@@ -6,6 +6,28 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import pandas as pd
 
+
+def set_seed(seed: int = 42):
+    import os
+    import random
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 # All 11 Chewie_CO sessions in chronological order
 ALL_SESSIONS = [
     "Chewie_20160928_001.mat",
@@ -78,6 +100,7 @@ def plot_cross_day_drift(df: pd.DataFrame, save_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Run 11-Day Cross-Session Alignment Benchmark")
+    parser.add_argument("--seed", type=int, default=42, help="Random state seed")
     parser.add_argument("--data_dir", type=str, default="./data", help="Directory where .mat files are stored")
     parser.add_argument("--source_file", type=str, default="Chewie_20160928_001.mat", help="Source session file")
     parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="Model checkpoints directory")
@@ -90,6 +113,8 @@ def main():
     parser.add_argument("--phase2_epochs", type=int, default=150, help="Epochs for Phase 2 alignment per day")
     parser.add_argument("--force_phase1", action="store_true", help="Force re-training Phase 1 even if ckpt exists")
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     os.makedirs(args.checkpoints_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)

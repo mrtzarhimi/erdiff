@@ -11,6 +11,27 @@ from vae import SequentialVAE
 from decoder_models import compute_r2_score, compute_rmse, compute_accuracy
 
 
+def set_seed(seed: int = 42):
+    import os
+    import random
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 @torch.no_grad()
 def run_inference(vae: SequentialVAE, loader, device: torch.device):
     """
@@ -118,6 +139,7 @@ def plot_kinematics_comparison(true_vel: torch.Tensor, pred_vel: torch.Tensor, s
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Aligned Latent Dynamics and Behavior Decoding")
+    parser.add_argument("--seed", type=int, default=42, help="Random state seed")
     parser.add_argument("--source_checkpoint", type=str, required=True, help="Path to Phase 1 source checkpoint (.pt)")
     parser.add_argument("--aligned_checkpoint", type=str, required=True, help="Path to Phase 2 target checkpoint (.pt)")
     parser.add_argument("--target_data_path", type=str, required=True, help="Path to target domain .mat file")
@@ -125,6 +147,8 @@ def main():
     parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins per trial")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

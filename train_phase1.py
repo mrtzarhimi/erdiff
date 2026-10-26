@@ -9,6 +9,26 @@ from vae import SequentialVAE, poisson_nll_loss, kl_divergence_loss, trajectory_
 from diffusion import LatentDiffusionModel, VPSDEScheduler, dsm_loss
 from decoder_models import compute_r2_score, compute_rmse
 
+def set_seed(seed: int = 42):
+    import os
+    import random
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def train_epoch_phase1(
     vae: SequentialVAE,
@@ -102,6 +122,7 @@ def evaluate_phase1(vae: SequentialVAE, loader, device: torch.device):
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: Source Domain Training (ERDiff)")
+    parser.add_argument("--seed", type=int, default=42, help="Random state seed")
     parser.add_argument("--data_path", type=str, required=True, help="Path to source session .mat file")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins per trial")
@@ -115,6 +136,8 @@ def main():
     parser.add_argument("--kl_weight", type=float, default=0.05, help="ELBO KL loss weight")
     parser.add_argument("--behavior_weight", type=float, default=2.0, help="Velocity MSE loss weight")
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

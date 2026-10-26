@@ -14,6 +14,27 @@ from diffusion import (
 from decoder_models import compute_r2_score, compute_rmse
 
 
+def set_seed(seed: int = 42):
+    import os
+    import random
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 @torch.no_grad()
 def extract_source_latent_bank(vae: SequentialVAE, source_loader, device: torch.device):
     """
@@ -162,6 +183,7 @@ def evaluate_target_alignment(
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 2: Target Domain Maximum Likelihood Alignment (ERDiff)")
+    parser.add_argument("--seed", type=int, default=42, help="Random state seed")
     parser.add_argument("--source_checkpoint", type=str, required=True, help="Path to saved Phase 1 checkpoint (.pt)")
     parser.add_argument("--source_data_path", type=str, required=True, help="Path to source session .mat file")
     parser.add_argument("--target_data_path", type=str, required=True, help="Path to target session .mat file")
@@ -174,6 +196,8 @@ def main():
     parser.add_argument("--augment_mult", type=int, default=3, help="Target data augmentation multiplier")
     parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off weighting Sinkhorn loss")
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
