@@ -28,3 +28,9 @@ def source_variance_floor_loss(target_mu, source_variance, floor_ratio=0.9, epsi
     source_std = torch.sqrt(reference.clamp_min(0) + epsilon)
     target_std = torch.sqrt(target_mu.var(dim=0, unbiased=True) + epsilon)
     return F.relu(floor_ratio * source_std - target_std).square().sum()
+
+
+def encoder_pool_variance_loss(encoder, training_spikes, source_variance, floor_ratio=0.9):
+    """Recompute differentiable means for the complete clean adaptation pool."""
+    means, _ = encoder(training_spikes)
+    return source_variance_floor_loss(means, source_variance, floor_ratio)

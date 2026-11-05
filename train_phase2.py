@@ -133,6 +133,8 @@ def train_epoch_phase2(
     source_variance=None,
     mla_variance_weight: float = 0.0,
     mla_variance_floor: float = 0.9,
+    mla_variance_scope: str = "batch",
+    variance_pool_spikes=None,
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
@@ -187,7 +189,17 @@ def train_epoch_phase2(
             from mla_stabilization import source_variance_floor_loss
             if source_variance is None:
                 raise ValueError("Variance stabilization requires a frozen source reference.")
-            loss_variance = source_variance_floor_loss(mu_t, source_variance, mla_variance_floor)
+            if mla_variance_scope == "full_train":
+                from mla_stabilization import encoder_pool_variance_loss
+                if variance_pool_spikes is None:
+                    raise ValueError("Full-training variance requires the clean adaptation training pool.")
+                loss_variance = encoder_pool_variance_loss(
+                    vae.encoder, variance_pool_spikes, source_variance, mla_variance_floor
+                )
+            elif mla_variance_scope == "batch":
+                loss_variance = source_variance_floor_loss(mu_t, source_variance, mla_variance_floor)
+            else:
+                raise ValueError(f"Unknown variance scope: {mla_variance_scope}")
             weighted_variance = (1.0 - alpha) * mla_variance_weight * loss_variance
             loss = loss + weighted_variance
             variance_value = loss_variance.item()
@@ -263,6 +275,8 @@ def main():
                         help="Optional source-variance stabilization weight within the MLA branch; zero disables it")
     parser.add_argument("--mla_variance_floor", type=float, default=0.9,
                         help="Floor as a fraction of source trial standard deviation, in (0, 1]")
+    parser.add_argument("--mla_variance_scope", choices=("batch", "full_train"), default="batch",
+                        help="Estimate penalty variance on the minibatch or all clean adaptation training trials")
     args = parser.parse_args()
     import math
     if not math.isfinite(args.mla_variance_weight) or args.mla_variance_weight < 0:
@@ -368,11 +382,18 @@ def main():
     print("Pre-computing source domain latent bank...")
     source_latents_bank = extract_source_latent_bank(vae, clean_source_loader, device)
     source_variance = None
+    variance_pool_spikes = None
     if args.mla_variance_weight > 0 and args.alpha < 1.0:
         from mla_stabilization import source_trial_variance
         source_variance = source_trial_variance(source_latents_bank[0])
-        if len(optimization_dataset) // len(alignment_loader) < 2:
-            raise ValueError("Variance stabilization needs at least two trials in every optimization batch.")
+        variance_trials = len(clean_target_loader.dataset)
+        if args.mla_variance_scope == "batch":
+            variance_trials = len(optimization_dataset) // len(alignment_loader)
+        if variance_trials < 2:
+            raise ValueError("Variance stabilization needs at least two trials in each variance estimate.")
+        if args.mla_variance_scope == "full_train":
+            variance_pool_spikes = clean_target_loader.dataset.spikes.to(device)
+        print(f"Variance penalty scope: {args.mla_variance_scope} | trials per estimate >= {variance_trials}")
 
     # 4. Initialize Target Read-In (handles both equal and mismatched neuron counts)
     warm_read_in = initialize_target_read_in(
@@ -443,6 +464,7 @@ def main():
                 "mla_t_max": args.mla_t_max, "mla_fixed_t": args.mla_fixed_t,
                 "mla_variance_weight": args.mla_variance_weight,
                 "mla_variance_floor": args.mla_variance_floor,
+                "mla_variance_scope": args.mla_variance_scope,
             },
         )
         diagnostics.record(0, vae, diffusion_model, scheduler, device, args.batch_size)
@@ -470,6 +492,8 @@ def main():
             source_variance=source_variance,
             mla_variance_weight=args.mla_variance_weight,
             mla_variance_floor=args.mla_variance_floor,
+            mla_variance_scope=args.mla_variance_scope,
+            variance_pool_spikes=variance_pool_spikes,
         )
 
         if epoch % 10 == 0 or epoch == args.epochs:
@@ -502,6 +526,7 @@ def main():
             "velocity_std": checkpoint_velocity_stats["velocity_std"],
             "alignment_epochs": args.epochs,
             "source_trial_variance": None if source_variance is None else source_variance.cpu(),
+            "variance_pool_trials": len(clean_target_loader.dataset),
             "source_self_check": args.source_self_check,
             "source_self_history": source_self_history,
             "diffusion_training": noise_config,
@@ -518,6 +543,7 @@ def main():
                 "mla_fixed_t": args.mla_fixed_t,
                 "mla_variance_weight": args.mla_variance_weight,
                 "mla_variance_floor": args.mla_variance_floor,
+                "mla_variance_scope": args.mla_variance_scope,
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
                 "augment_mult": args.augment_mult,

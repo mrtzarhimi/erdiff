@@ -171,6 +171,19 @@ The coefficient $\rho$ is a \emph{standard-deviation} fraction: $\rho=0.9$
 corresponds approximately to an 81\% variance floor when variances are well
 above $\delta$. It is a soft penalty, not a hard bound.
 
+The default \texttt{batch} scope uses the current MLA minibatch for $B$.
+The optional \texttt{full\_train} scope instead sets $B$ to the number of
+\emph{unique clean adaptation training trials}. It recomputes all their means
+with the current encoder at every optimizer step, retains their computation
+graph, and backpropagates the exact full-pool penalty. It does not use a
+detached or stale estimate, augment the pool, or include validation/test
+trials. MLA itself still uses the balanced shuffled minibatch. This removes
+minibatch sampling variation from the variance estimate, but the estimate
+still changes as the read-in changes. The extra forward graph increases
+memory and computation; this implementation does not silently approximate it
+with detached chunk statistics. The penalty is applied once per optimizer
+step with the same weight in either scope.
+
 Variance is taken across trials separately at every time bin. A shared,
 time-varying trajectory repeated for every trial therefore cannot satisfy
 this floor merely by retaining temporal variation. Conversely, penalizing only
@@ -237,6 +250,7 @@ Control & Meaning\\
 \midrule
 \texttt{--mla\_variance\_weight} & $\lambda_v$, nonnegative; default 0.\\
 \texttt{--mla\_variance\_floor} & $\rho$, in $(0,1]$; default 0.9.\\
+\texttt{--mla\_variance\_scope} & \texttt{batch} or \texttt{full\_train}; default \texttt{batch}.\\
 \texttt{--alpha} & MLA/OT mixing weight; use 0 to isolate this experiment.\\
 \bottomrule
 \end{tabularx}
