@@ -123,6 +123,9 @@ def train_epoch_phase2(
     optimizer: optim.Optimizer,
     device: torch.device,
     alpha: float = 0.5,
+    ot_epsilon: float = 0.1,
+    sinkhorn_iters: int = 100,
+    smooth_weight: float = 0.0,
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
@@ -149,16 +152,19 @@ def train_epoch_phase2(
         perm = torch.randperm(num_source_samples, device=device)[:batch_size]
         z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm])
 
-        # 3. Compute MLA + Sinkhorn + Trajectory Smoothness
+        # 3. Compute paper MLA + regularized OT; smoothness is an optional variant.
         loss_align = total_alignment_loss(
             diffusion_model=diffusion_model,
             scheduler=scheduler,
             z_target=z_target,
             z_source=z_source_batch,
             alpha=alpha,
+            ot_epsilon=ot_epsilon,
+            sinkhorn_iters=sinkhorn_iters,
         )
-        loss_smooth = trajectory_smoothness_loss(mu_t)
-        loss = loss_align + 0.2 * loss_smooth
+        loss = loss_align
+        if smooth_weight:
+            loss = loss + smooth_weight * trajectory_smoothness_loss(mu_t)
 
         # 4. Update ONLY encoder.read_in
         loss.backward()
@@ -185,6 +191,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=150, help="Alignment epochs")
     parser.add_argument("--augment_mult", type=int, default=3, help="Target data augmentation multiplier")
     parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off weighting Sinkhorn loss")
+    parser.add_argument("--ot_epsilon", type=float, default=0.1, help="Entropy weight for full-trajectory transport")
+    parser.add_argument("--sinkhorn_iters", type=int, default=100, help="Log-domain transport scaling iterations")
+    parser.add_argument("--smooth_weight", type=float, default=0.0, help="Optional trajectory-smoothness variant; paper default is zero")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -293,6 +302,9 @@ def main():
             optimizer=alignment_optimizer,
             device=device,
             alpha=args.alpha,
+            ot_epsilon=args.ot_epsilon,
+            sinkhorn_iters=args.sinkhorn_iters,
+            smooth_weight=args.smooth_weight,
         )
 
         if epoch % 10 == 0 or epoch == args.epochs:
@@ -311,6 +323,17 @@ def main():
             "alignment_epochs": args.epochs,
             "split_indices": target_data_metadata["split_indices"],
             "split_seed": target_data_metadata["split_seed"],
+            "alignment_config": {
+                "alpha": args.alpha,
+                "ot_epsilon": args.ot_epsilon,
+                "sinkhorn_iters": args.sinkhorn_iters,
+                "smooth_weight": args.smooth_weight,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "augment_mult": args.augment_mult,
+                "seed": args.seed,
+                "batch_size": args.batch_size,
+            },
         },
         save_path,
     )

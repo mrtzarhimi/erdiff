@@ -251,9 +251,10 @@ def mla_loss(
     # Denoiser evaluates whether the spatio-temporal structure fits source dynamics
     eps_pred = diffusion_model(z_t, t)
 
-    # Weighted noise residual: || eps - eps_theta(z_t, t) ||^2
-    # The error drives encoder updates
-    residual_loss = torch.mean((eps - eps_pred) ** 2)
+    # Eq. 26 uses a squared norm over each complete latent trajectory.
+    # Unit w(t)^2 is used here; the paper leaves its weighting choice open.
+    # The VP drift-divergence term is constant with respect to the read-in.
+    residual_loss = (eps - eps_pred).square().flatten(start_dim=1).sum(dim=1).mean()
     return residual_loss
 
 
@@ -261,37 +262,36 @@ def sinkhorn_loss(
     z_source: torch.Tensor,
     z_target: torch.Tensor,
     epsilon: float = 0.1,
-    num_iters: int = 30,
+    num_iters: int = 100,
 ) -> torch.Tensor:
     """
-    Entropy-regularized Optimal Transport / Sinkhorn Divergence (Equation 27).
-    Normalized by trajectory dimensionality (seq_len * latent_dim) so its scale
-    matches the element-wise mean in mla_loss.
+    Paper Eq. 27: squared trajectory cost plus entropy-regularized transport.
+    H(gamma) is the negative-entropy convention sum(gamma * log(gamma)).
+    This is regularized OT, not a debiased Sinkhorn divergence.
     """
-    b_s, l, d = z_source.shape
+    if epsilon <= 0 or num_iters < 1:
+        raise ValueError("Sinkhorn epsilon and iteration count must be positive.")
+    b_s = z_source.size(0)
     b_t = z_target.size(0)
-    x = z_source.reshape(b_s, -1)
-    y = z_target.reshape(b_t, -1)
+    x = z_source.reshape(b_s, -1).to(torch.float64)
+    y = z_target.reshape(b_t, -1).to(torch.float64)
 
-    # Mean squared Euclidean cost per time-latent element
-    cost = (torch.cdist(x, y, p=2.0) ** 2) / (l * d)
-
-    mu = torch.full((b_s,), 1.0 / b_s, device=z_source.device)
-    nu = torch.full((b_t,), 1.0 / b_t, device=z_target.device)
-
-    # Stabilized kernel matrix
-    K = torch.exp(-cost / epsilon)
-
-    u = torch.ones_like(mu)
-    v = torch.ones_like(nu)
-
-    for _ in range(num_iters):
-        u = mu / (torch.matmul(K, v) + 1e-8)
-        v = nu / (torch.matmul(K.t(), u) + 1e-8)
-
-    gamma = u.unsqueeze(1) * K * v.unsqueeze(0)
-    loss = torch.sum(gamma * cost)
-    return loss
+    cost = torch.cdist(x, y, p=2.0).square()
+    # Solve for the plan without tracking the iterations. At the optimum,
+    # the envelope theorem gives dL/dC = gamma for the full regularized value.
+    with torch.no_grad():
+        log_kernel = -cost.detach() / epsilon
+        log_mu = -torch.log(cost.new_tensor(float(b_s)))
+        log_nu = -torch.log(cost.new_tensor(float(b_t)))
+        log_u = torch.zeros(b_s, dtype=cost.dtype, device=cost.device)
+        log_v = torch.zeros(b_t, dtype=cost.dtype, device=cost.device)
+        for _ in range(num_iters):
+            log_u = log_mu - torch.logsumexp(log_kernel + log_v.unsqueeze(0), dim=1)
+            log_v = log_nu - torch.logsumexp(log_kernel + log_u.unsqueeze(1), dim=0)
+        log_gamma = log_u.unsqueeze(1) + log_kernel + log_v.unsqueeze(0)
+        gamma = torch.exp(log_gamma)
+    loss = torch.sum(gamma * cost) + epsilon * torch.sum(gamma * log_gamma)
+    return loss.to(z_target.dtype)
 
 
 def total_alignment_loss(
@@ -300,11 +300,13 @@ def total_alignment_loss(
     z_target: torch.Tensor,
     z_source: torch.Tensor,
     alpha: float = 0.5,
+    ot_epsilon: float = 0.1,
+    sinkhorn_iters: int = 100,
 ) -> torch.Tensor:
     """
     Total Phase 2 Alignment Loss:
       L = (1 - alpha) * L_MLA + alpha * L_SHD
     """
     loss_mla = mla_loss(diffusion_model, scheduler, z_target)
-    loss_shd = sinkhorn_loss(z_source, z_target)
+    loss_shd = sinkhorn_loss(z_source, z_target, epsilon=ot_epsilon, num_iters=sinkhorn_iters)
     return (1.0 - alpha) * loss_mla + alpha * loss_shd

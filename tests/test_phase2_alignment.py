@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataloader import NHPDataset
+from diffusion import sinkhorn_loss
 from train_phase2 import clean_training_view, sample_latent_posterior
 
 
@@ -24,3 +25,13 @@ def test_alignment_samples_posterior_while_encoder_is_in_eval_mode():
     noise = torch.tensor([[[3.0]]])
 
     assert torch.equal(sample_latent_posterior(mu, logvar, noise), torch.tensor([[[5.0]]]))
+
+
+def test_transport_uses_full_squared_trajectory_cost_and_gradient():
+    source = torch.tensor([[[0.0, 0.0]]])
+    target = torch.tensor([[[2.0, 0.0]]], requires_grad=True)
+    loss = sinkhorn_loss(source, target, epsilon=0.1)
+    gradient = torch.autograd.grad(loss, target)[0]
+
+    assert torch.allclose(loss, torch.tensor(4.0))
+    assert torch.allclose(gradient, torch.tensor([[[4.0, 0.0]]]))
