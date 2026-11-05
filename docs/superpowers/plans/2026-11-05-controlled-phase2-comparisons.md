@@ -111,17 +111,19 @@
 
 **Interfaces:** CLI `--reference_run PATH --protocol source_self|synthetic|cross_day --case reference|control|fixed_noise|matched_size|gradient_balance|all --output_root PATH`. Base seeds default 42 and must agree with the reference. Cases resolve to explicit flags and a saved resolved manifest before any future training starts.
 
-- [ ] Write checks that all cases share baseline hyperparameters and per-session budget, change only declared factors, use unique output directories, restore saved target splits, and propagate frozen checks/mappings/noise controls to evaluation.
-- [ ] Define cases exactly as in the spec: reference R150; controlled C0 with full variance weight 10/floor 0.9; F/S/G individual factors; ALL combines them. Include source self-copy identity and matched-initialization shape controls. A source self-check with equal width does not demonstrate unequal-width performance.
-- [ ] Add real channel removal to the source-only development matrix. Preserve adaptation/evaluation interval grouping and source-test reservation. Match candidates' optimizer updates within each protocol and report different cohort exposures.
-- [ ] Forward all new arguments through orchestration and checkpoint metadata. Do not overwrite existing runs or silently retrain Phase 1 when a specified checkpoint is missing; fail clearly.
-- [ ] Update `noted.tex` with independent Gaussian streams, budget matching, width mapping limitations, gradient calibration math, freeze assertions and the ablation matrix. Do not compile.
+- [x] Write checks that all cases share baseline hyperparameters and a 150-epoch per-session budget, change only declared factors, use unique output directories, restore saved target splits, reject raw-window overlap and verify forwarding of frozen/noise/mapping/gradient controls. Tests remain unrun.
+- [x] Define cases exactly as in the spec: reference R150; controlled C0 with full variance weight 10/floor 0.9; F/S/G individual factors; ALL combines them. Record source self-copy identity and that equal-width source self-check does not demonstrate unequal-width performance.
+- [x] Keep actual channel removal in the source-only development matrix. Preserve disjoint adaptation/evaluation source-validation intervals and source-test reservation. Candidates use the same cohort and epoch count; update counts and sample exposures are recorded.
+- [x] Forward controls through orchestration and manifests. Existing output roots are rejected, and a specified missing Phase 1 checkpoint fails rather than retraining.
+- [x] Update `noted.tex` with independent Gaussian streams, budget matching, width mapping limitations, gradient calibration math, freeze assertions and the ablation matrix. XeLaTeX was not run.
 - [ ] When authorized: `pytest tests/test_controlled_phase2_runs.py -q`; expected tests pass. No source/target pipeline execution is currently permitted.
-- [ ] Commit: `feat: orchestrate budget-matched Phase 2 ablations`.
+- [x] Commit: `feat: orchestrate budget-matched Phase 2 ablations`.
 
-## Planned checking commands (not implemented CLI yet)
+**Execution note:** the CLI, source-only protocols, cross-day split/fingerprint gate, tests, plan and research note are implemented. Runtime tests, Phase 1/2, cross-day evaluation and XeLaTeX were not run under the no-execution instruction. Cross-day use remains contingent on preparing a manifest with saved per-session splits, fingerprints and preprocessing.
 
-After implementation/review and a verified `reference_r150.json` have been prepared, the user can request execution. These examples describe the intended interface and must not be pasted into the current code as if available today.
+## Implemented checking commands (execution remains disabled)
+
+After implementation/review and a reference manifest with required provenance have been prepared, the user can request execution. The JSON must include an R150 resolved configuration, source checkpoint/data paths, saved source splits, and (for cross-day) a `target_sessions` map keyed by exact session filename. Each target entry must include `target_split_indices` with indexed raw-window `window_intervals`, `data_fingerprint.sha256`, and session preprocessing provenance. The cross-day launcher hashes each session file and rejects missing or mismatched artifacts.
 
 ```bash
 # Independent source self-checks, all using the same reference budget.
@@ -144,7 +146,7 @@ python controlled_phase2_runs.py \
   --case all --output_root ./controlled_cross_day_all42
 ```
 
-The reference fixes model/split/noise/mapping seeds at 42; each stream has its own namespace. Every case verifies the frozen denoiser. The ALL case activates fixed Gaussian banks, optional width matching, component-gradient logging and source-calibrated gradient scaling in addition to C0's full-training variance penalty. Its improvement is unknown and cannot be presumed from activating more options.
+The reference fixes model/split/noise/mapping seeds at 42; each stream has its own namespace. Every case verifies the frozen denoiser. The ALL case activates fixed Gaussian banks, optional width matching, component-gradient logging and source-calibrated gradient scaling in addition to C0's full-training variance penalty. Its improvement is unknown and cannot be presumed from activating more options. Each case uses an isolated output directory; existing directories are rejected. A specified missing Phase 1 checkpoint is an error. Synthetic cases retain disjoint source-validation adaptation/evaluation intervals and reserve the source test split.
 
 ## GPT-6 Luna implementation prompt
 

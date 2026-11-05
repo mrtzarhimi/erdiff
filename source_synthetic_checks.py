@@ -20,7 +20,8 @@ from phase2_freeze_guard import FrozenDiffusionGuard
 from neuron_input_mapping import NeuronInputMap
 from phase2_sampling import make_alignment_loader, source_sampling_generator
 from synthetic_shifts import apply_shift, make_shift, oracle_readin_weight, validation_development_split
-from train_phase2 import clean_training_view, extract_source_latent_bank, set_seed, train_epoch_phase2
+from train_phase2 import (build_source_gradient_calibration, clean_training_view,
+                          extract_source_latent_bank, set_seed, train_epoch_phase2)
 from vae import SequentialVAE
 
 
@@ -72,6 +73,7 @@ def main():
     parser.add_argument("--seq_len", type=int, default=39)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--mla_variance_floor", type=float, default=0.9)
     parser.add_argument("--mla_variance_scope", choices=("batch", "full_train"), default="full_train")
     parser.add_argument("--diagnostics", action="store_true")
@@ -81,6 +83,20 @@ def main():
     parser.add_argument("--noise_bank_path", default=None)
     parser.add_argument("--match_input_size", action="store_true")
     parser.add_argument("--input_mapping_seed", type=int, default=42)
+    parser.add_argument("--alpha", type=float, default=0.0,
+                        help="MLA/OT mixture; default 0 retains historical MLA-only synthetic checks")
+    parser.add_argument("--ot_epsilon", type=float, default=None)
+    parser.add_argument("--sinkhorn_iters", type=int, default=100)
+    parser.add_argument("--smooth_weight", type=float, default=0.0)
+    parser.add_argument("--mla_t_min", type=float, default=None)
+    parser.add_argument("--mla_t_max", type=float, default=None)
+    parser.add_argument("--mla_fixed_t", type=float, default=None)
+    parser.add_argument("--gradient_balance", choices=("none", "source_calibrated"), default="none")
+    parser.add_argument("--gradient_calibration_batches", type=int, default=3)
+    parser.add_argument("--gradient_calibration_seed", type=int, default=42)
+    parser.add_argument("--gradient_calibration_path", default=None)
+    parser.add_argument("--log_component_gradients", action="store_true")
+    parser.add_argument("--frozen_check", choices=("final", "every_epoch"), default="every_epoch")
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 2 or not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError("Use positive epochs/lr and batch size >= 2.")
@@ -88,6 +104,13 @@ def main():
         raise ValueError("Variance floor must be in (0, 1] and weights finite/nonnegative.")
     if args.noise_bank_replicates < 1:
         raise ValueError("Noise bank replicate count must be positive.")
+    if not 0 <= args.alpha <= 1 or args.gradient_calibration_batches < 1:
+        raise ValueError("alpha must be in [0, 1] and calibration batches must be positive.")
+    if args.gradient_balance == "source_calibrated" and any(
+            value is not None for value in (args.mla_t_min, args.mla_t_max, args.mla_fixed_t)):
+        raise ValueError("Source-synthetic gradient calibration does not yet support restricted MLA times.")
+    if args.weight_decay < 0:
+        raise ValueError("weight_decay must be nonnegative.")
 
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -129,11 +152,48 @@ def main():
     )
     noise = checkpoint["diffusion_training"]
     scheduler = VPSDEScheduler(noise["beta_min"], noise["beta_max"], noise["T"], noise["t_min"])
+    ot_epsilon = args.ot_epsilon if args.ot_epsilon is not None else 0.1 * args.seq_len * checkpoint["latent_dim"]
     probe_times = [t for t in (0.01, 0.05, 0.2, 0.5, 0.9) if scheduler.t_min <= t <= scheduler.T]
     if not probe_times:
         probe_times = [(scheduler.t_min + scheduler.T) / 2]
     bank = extract_source_latent_bank(source, clean_training_view(train, args.batch_size), device)
     reference_variance = source_trial_variance(bank.mu)
+    gradient_calibration = None
+    ot_scale = 1.0
+    if args.gradient_balance == "source_calibrated":
+        calibration_path = Path(args.gradient_calibration_path or output / "source_gradient_calibration.json")
+        calibration_provenance = {
+            "source_checkpoint_sha256": source_hash,
+            "source_data_sha256": data_hash,
+            "calibration_seed": args.gradient_calibration_seed,
+            "probe_batches": args.gradient_calibration_batches,
+            "alpha": args.alpha,
+            "ot_epsilon": ot_epsilon,
+            "sinkhorn_iters": args.sinkhorn_iters,
+            "mla_variance_weight": args.weights[0],
+            "mla_variance_floor": args.mla_variance_floor,
+            "mla_variance_scope": args.mla_variance_scope,
+            "fixture": "clean_source_training_fixed_gaussian_v1",
+        }
+        if calibration_path.is_file():
+            from alignment_gradient_diagnostics import load_gradient_calibration
+            gradient_calibration = load_gradient_calibration(str(calibration_path), calibration_provenance)
+        else:
+            calibration_source = copy.deepcopy(source)
+            gradient_calibration = build_source_gradient_calibration(
+                calibration_source, denoiser, scheduler,
+                clean_training_view(train, args.batch_size), bank, device,
+                alpha=args.alpha, ot_epsilon=ot_epsilon, sinkhorn_iters=args.sinkhorn_iters,
+                probe_batches=args.gradient_calibration_batches,
+                seed=args.gradient_calibration_seed, provenance=calibration_provenance,
+                mla_variance_weight=args.weights[0], mla_variance_floor=args.mla_variance_floor,
+                mla_variance_scope=args.mla_variance_scope,
+            )
+            from alignment_gradient_diagnostics import save_gradient_calibration
+            save_gradient_calibration(str(calibration_path), gradient_calibration)
+        if not gradient_calibration.get("valid"):
+            raise ValueError(f"Source-only gradient calibration invalid: {gradient_calibration.get('reason')}")
+        ot_scale = float(gradient_calibration["c_ot"])
     clean_predictions = predict(source, validation_spikes[evaluation_offsets], device, args.batch_size)
     clean_metrics = metrics(clean_predictions, evaluation_velocity, checkpoint)
     shifts = {kind: make_shift(kind, n_neurons, args.shift_seed, args.mask_fraction) for kind in args.shifts}
@@ -165,6 +225,14 @@ def main():
         "noise_bank_replicates": args.noise_bank_replicates,
         "noise_bank_path": noise_bank_path if noise_bank is not None else None,
         "probe_noise_namespace": "independent_mla_diagnostics_fixture",
+        "alpha": args.alpha, "ot_epsilon": ot_epsilon,
+        "gradient_balance": args.gradient_balance,
+        "gradient_calibration": gradient_calibration,
+        "gradient_calibration_path": str(calibration_path) if args.gradient_balance == "source_calibrated" else None,
+        "frozen_check": args.frozen_check,
+        "smooth_weight": args.smooth_weight,
+        "mla_t_min": args.mla_t_min, "mla_t_max": args.mla_t_max,
+        "mla_fixed_t": args.mla_fixed_t,
     }, output / "synthetic_manifest.pt")
     print(f"Source-only development: adaptation={len(adaptation_offsets)}, evaluation={len(evaluation_offsets)}")
     print(f"Clean source evaluation R2={clean_metrics['r2']:.2f}% | source SHA256={source_hash}")
@@ -217,7 +285,8 @@ def main():
             model = copy.deepcopy(source)
             model.encoder.read_in = copy.deepcopy(initial_readin)
             loader = make_alignment_loader(dataset, args.batch_size, args.seed)
-            optimizer = torch.optim.Adam(model.encoder.read_in.parameters(), lr=args.lr)
+            optimizer = torch.optim.Adam(model.encoder.read_in.parameters(), lr=args.lr,
+                                         weight_decay=args.weight_decay)
             source_rng = source_sampling_generator(args.seed)
             pool = adaptation_spikes.to(device) if args.mla_variance_scope == "full_train" else None
             run_dir = output / f"{kind}_w{weight:g}"
@@ -247,22 +316,28 @@ def main():
             print(f"\n{kind}, weight={weight:g}: baseline R2={before['r2']:.2f}% | updates/epoch={len(loader)}")
             for epoch in range(1, args.epochs + 1):
                 losses = train_epoch_phase2(
-                    model, denoiser, scheduler, loader, bank, optimizer, device, alpha=0.0,
-                    ot_epsilon=0.1 * args.seq_len * checkpoint["latent_dim"],
+                    model, denoiser, scheduler, loader, bank, optimizer, device, alpha=args.alpha,
+                    ot_epsilon=ot_epsilon, sinkhorn_iters=args.sinkhorn_iters,
+                    smooth_weight=args.smooth_weight,
+                    mla_t_min=args.mla_t_min, mla_t_max=args.mla_t_max,
+                    mla_fixed_t=args.mla_fixed_t,
                     source_variance=reference_variance, mla_variance_weight=weight,
                     mla_variance_floor=args.mla_variance_floor, mla_variance_scope=args.mla_variance_scope,
                     variance_pool_spikes=pool,
                     noise_bank=noise_bank,
                     noise_replicate=(epoch - 1) % args.noise_bank_replicates,
                     source_sampling_rng=source_rng,
+                    gradient_balance=args.gradient_balance, ot_scale=ot_scale,
+                    log_component_gradients=args.log_component_gradients,
                     target_noise_domain=target_noise_domains[kind],
                     source_noise_domain=source_noise_domain,
                 )
-                denoiser_guard.verify_or_record_failure(
-                    (optimizer,), failure_path=str(failure_path),
-                    context={"stage": "synthetic_epoch_end", "epoch": epoch,
-                             "shift": kind, "variance_weight": weight, "seed": args.seed},
-                )
+                if args.frozen_check == "every_epoch":
+                    denoiser_guard.verify_or_record_failure(
+                        (optimizer,), failure_path=str(failure_path),
+                        context={"stage": "synthetic_epoch_end", "epoch": epoch,
+                                 "shift": kind, "variance_weight": weight, "seed": args.seed},
+                    )
                 if epoch in (1, 5) or epoch % 10 == 0 or epoch == args.epochs:
                     current = metrics(predict(model, evaluation_spikes, device, args.batch_size), evaluation_velocity, checkpoint)
                     history.append({"epoch": epoch, "losses": losses, "evaluation": current})
@@ -292,9 +367,11 @@ def main():
                 ),
                 "initialization": synthetic_init,
                 "variance_floor": args.mla_variance_floor, "lr": args.lr,
+                "weight_decay": args.weight_decay,
                 "seed": args.seed, "split_seed": args.split_seed, "shift_seed": args.shift_seed,
                 "adaptation_trials": len(adaptation_offsets), "evaluation_trials": len(evaluation_offsets),
                 "epochs": args.epochs, "updates": args.epochs * len(loader),
+                "sample_exposures": args.epochs * len(adaptation_spikes),
                 "clean_source_r2": clean_metrics["r2"], "oracle_r2": oracle_r2,
                 "oracle_prediction_max_error": oracle_error,
                 "before_r2": before["r2"], "after_r2": after["r2"], "r2_gain": after["r2"] - before["r2"],
@@ -312,6 +389,7 @@ def main():
                 "read_in": {name: value.detach().cpu() for name, value in model.encoder.read_in.state_dict().items()},
                 "shift": shift, "metrics": row, "arguments": vars(args),
                 "input_mapping": mapping_state,
+                "gradient_calibration": gradient_calibration,
                 "adaptation_indices": validation_ids[adaptation_offsets],
                 "evaluation_indices": validation_ids[evaluation_offsets],
             }, run_dir / "synthetic_readin.pt")

@@ -293,6 +293,68 @@ or semantic ambiguity, and does not establish improved decoding.
 
 \section{Implementation and controlled comparison}
 
+The controlled-run launcher accepts an immutable reference manifest, a protocol,
+and one case. It writes the resolved case manifest before dispatching training.
+All requested comparisons use model seed 42, split seed 42, and the reference's
+150-epoch budget. The source-only calibration seed, mapping seed and fixed-bank
+seed are independently recorded as 42; their generator namespaces remain
+separate. Optimizer updates and adaptation sample exposures are recorded at
+runtime because sessions can have different cohort sizes. Equal epochs alone
+do not imply equal sample exposure.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Case & Explicit Phase 2 configuration change relative to the reference\\
+\midrule
+\texttt{reference} & Replay the reference settings and saved splits (R150).\\
+\texttt{control} & C0: variance weight 10, standard-deviation floor 0.9, full clean training-pool scope; resampled noise, native input width, and no gradient scaling.\\
+\texttt{fixed\_noise} & C0 plus a trial-indexed fixed Gaussian bank.\\
+\texttt{matched\_size} & C0 plus deterministic input-width mapping to the source width.\\
+\texttt{gradient\_balance} & C0 plus source-only calibrated OT gradient scaling and component-gradient logging.\\
+\texttt{all} & C0 plus fixed noise, width mapping, and source-calibrated gradient scaling.\\
+\bottomrule
+\end{tabularx}
+\caption{Predeclared controlled cases. They are comparisons, not a claim that
+the combined case is better.}
+\end{table}
+
+Fixed noise changes repeated-run variance, not information leakage: the
+alignment Gaussian bank is generated from independent stream namespaces and is
+keyed by trial identity. The diagnostic probe noise is separate from fitting
+noise. Gradient scaling is calibrated on fixed clean source-training probes;
+no target behavior labels enter optimization or calibration. Every Phase 2
+case keeps the denoiser frozen and verifies its state. The frozen check can run
+at the end or every epoch, but it cannot be disabled.
+
+For source-self runs, validation trials are used only for reporting, while
+adaptation uses the source training split. The equal-width source self-copy is
+an identity control; it does not establish recovery under unequal input widths.
+The synthetic protocol applies fixed permutations, gains, masks, and actual
+channel removal to disjoint source-validation adaptation and evaluation groups.
+The source test split remains reserved. A channel-removal oracle is available
+only as a known synthetic calibration; it is not an initialization for fitting.
+
+Cross-day comparisons require the reference manifest to include each named
+session's exact target split indices, raw-window intervals, and data SHA-256.
+The launcher hashes each session file before alignment and rejects any
+mismatch. It does not infer a replacement test set or silently retrain Phase
+1 when a checkpoint was specified. Historical manifests with incomplete
+fields may be run only as labelled known-configuration replays; they are not
+promoted to exact reproductions. The output records per-session update counts,
+sample exposures, channel widths, and evaluation metrics.
+
+The reference, variance control, noise, width, and gradient settings are
+written to each resolved manifest before training begins. Case output folders
+are unique and existing folders are rejected, so prior results are not
+overwritten. A fixed bank and source calibration artifact are shared across
+paired cases where their provenance is compatible. Native unequal widths
+remain the default; matching width can discard channels and is an explicit
+information-loss variant. For equal-width source self-checks it reduces to an
+identity map, so the synthetic channel-removal protocol is the relevant width
+recovery check.
+
 \begin{tabularx}{\linewidth}{@{}lX@{}}
 \toprule
 Control & Meaning\\
