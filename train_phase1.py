@@ -135,7 +135,7 @@ def inspect_source_timebase(file_path: str, seq_len: int):
     print(
         f"Stored time_frame spacing: median={median_dt:.8g}, "
         f"5th/95th percentiles={np.percentile(valid_deltas, [5, 95]).tolist()} "
-        f"(native time units); {seq_len} samples span approximately "
+        f"(native time units); {seq_len} raw samples span approximately "
         f"{(seq_len - 1) * median_dt:.8g} native time units."
     )
     print(
@@ -187,7 +187,10 @@ def main():
         augment_multiplier=args.augment_mult,
         split_seed=args.split_seed,
     )
-    print(f"Loaded source domain with {n_neurons} neurons across trials of length {args.seq_len}.")
+    print(
+        f"Loaded source domain with {n_neurons} neurons across trials of "
+        f"{args.seq_len} bins at {velocity_stats['preprocessing']['bin_width_s'] * 1000:g} ms/bin."
+    )
 
     # Use the same clean, deterministic evaluation path for both partitions.
     # The optimization loader repeats trials and perturbs spikes, so its batch
@@ -307,6 +310,7 @@ def main():
                     "velocity_std": velocity_stats["velocity_std"],
                     "split_indices": velocity_stats["split_indices"],
                     "split_seed": velocity_stats["split_seed"],
+                    "preprocessing": velocity_stats["preprocessing"],
                 },
                 save_path,
             )

@@ -59,8 +59,9 @@ def load_nhp_session(
     seq_len: int = 39,
     smooth_sigma: float = 2.5,
     neural_lag_bins: int = 4,  # Motor cortex spikes lead hand velocity by ~80ms (4 bins)
+    bin_width_s: float = 0.02,
 ):
-    """Load fixed cue-aligned trials without using behavior values to place windows.
+    """Load cue-aligned trials after aggregating raw samples into 20 ms bins.
 
     Velocity peaks are deliberately not used for window selection: doing so would
     let target behavior determine which neural samples enter evaluation.
@@ -76,6 +77,21 @@ def load_nhp_session(
     if raw_velocity.shape[0] < raw_velocity.shape[1]:
         raw_velocity = raw_velocity.T
     time_frame = np.array(xds["time_frame"]).flatten()
+    if time_frame.size != raw_spikes.shape[0] or time_frame.size != raw_velocity.shape[0]:
+        raise ValueError("time_frame, spike_counts, and curs_v must have the same raw sample count.")
+    deltas = np.diff(time_frame.astype(np.float64))
+    if deltas.size == 0 or not np.all(np.isfinite(deltas) & (deltas > 0)):
+        raise ValueError("time_frame must contain increasing finite timestamps.")
+    sample_spacing_s = float(np.median(deltas))
+    if bin_width_s <= 0:
+        raise ValueError("bin_width_s must be positive.")
+    samples_per_bin = round(bin_width_s / sample_spacing_s)
+    if samples_per_bin < 1 or not np.isclose(
+        samples_per_bin * sample_spacing_s, bin_width_s, rtol=0.01, atol=0
+    ):
+        raise ValueError("Requested bin width is not an integer multiple of raw sample spacing.")
+    if not np.allclose(deltas, sample_spacing_s, rtol=0.01, atol=1e-8):
+        raise ValueError("Raw time_frame is not uniformly sampled; fixed-size binning would misalign signals.")
     go_cues = np.array(xds.get("trial_gocue_time", xds.get("trial_start_time"))).flatten()
     if np.all(np.isnan(go_cues)):
         go_cues = np.array(xds["trial_start_time"]).flatten()
@@ -108,6 +124,7 @@ def load_nhp_session(
             go_index=idx_go,
             seq_len=seq_len,
             neural_lag_bins=neural_lag_bins,
+            samples_per_bin=samples_per_bin,
         )
 
         if (
@@ -117,7 +134,9 @@ def load_nhp_session(
             and spk_end <= raw_spikes.shape[0]
             and vel_end <= raw_velocity.shape[0]
         ):
-            spike_window = raw_spikes[spk_start:spk_end, :]
+            spike_window, velocity_window = bin_trial_arrays(
+                raw_spikes, raw_velocity, spk_start, vel_start, seq_len, samples_per_bin
+            )
             if smooth_sigma > 0:
                 # Smooth within a trial only, so a neighboring trial assigned
                 # to another split cannot contribute signal across its boundary.
@@ -125,7 +144,7 @@ def load_nhp_session(
                     spike_window, sigma=smooth_sigma, axis=0
                 )
             trials_spikes.append(spike_window)
-            trials_vel.append(raw_velocity[vel_start:vel_end, :])
+            trials_vel.append(velocity_window)
             trial_intervals.append((spk_start, max(spk_end, vel_end)))
 
             if target_angles is not None:
@@ -145,13 +164,25 @@ def load_nhp_session(
     return x_data, y_data, targets, torch.tensor(trial_intervals, dtype=torch.long)
 
 
-def fixed_window_bounds(go_index: int, seq_len: int, neural_lag_bins: int = 0):
-    """Return velocity and spike window bounds from the go cue alone."""
+def fixed_window_bounds(go_index: int, seq_len: int, neural_lag_bins: int = 0, samples_per_bin: int = 1):
+    """Return raw-sample bounds for binned velocity and lagged spikes."""
     vel_start = go_index
-    vel_end = vel_start + seq_len
-    spk_start = vel_start - neural_lag_bins
-    spk_end = spk_start + seq_len
+    vel_end = vel_start + seq_len * samples_per_bin
+    spk_start = vel_start - neural_lag_bins * samples_per_bin
+    spk_end = spk_start + seq_len * samples_per_bin
     return vel_start, vel_end, spk_start, spk_end
+
+
+def bin_trial_arrays(raw_spikes, raw_velocity, spk_start, vel_start, seq_len, samples_per_bin):
+    """Sum spike counts and average velocity within each raw-sample bin."""
+    raw_length = seq_len * samples_per_bin
+    spikes = raw_spikes[spk_start:spk_start + raw_length].reshape(
+        seq_len, samples_per_bin, raw_spikes.shape[1]
+    ).sum(axis=1)
+    velocity = raw_velocity[vel_start:vel_start + raw_length].reshape(
+        seq_len, samples_per_bin, raw_velocity.shape[1]
+    ).mean(axis=1)
+    return spikes, velocity
 
 
 def denormalize_velocity(velocity: torch.Tensor, velocity_stats):
@@ -232,6 +263,7 @@ def get_nhp_dataloaders(
     test_ratio: float = 0.15,
     split_seed: int = 42,
     seq_len: int = 39,
+    bin_width_s: float = 0.02,
     augment_multiplier: int = 5,
     velocity_stats=None,
     split_indices=None,
@@ -239,7 +271,9 @@ def get_nhp_dataloaders(
     include_test: bool = True,
     include_behavior: bool = True,
 ):
-    x_data, y_data, targets, window_intervals = load_nhp_session(file_path=file_path, seq_len=seq_len)
+    x_data, y_data, targets, window_intervals = load_nhp_session(
+        file_path=file_path, seq_len=seq_len, bin_width_s=bin_width_s
+    )
     num_trials = x_data.shape[0]
 
     if split_indices is None:
@@ -338,5 +372,13 @@ def get_nhp_dataloaders(
             "session_path": os.path.realpath(file_path),
         },
         "split_seed": split_seed,
+        "preprocessing": {
+            "window_anchor": "go_cue",
+            "bin_width_s": bin_width_s,
+            "smooth_sigma_bins": 2.5,
+            "neural_lag_bins": 4,
+            "spike_aggregation": "sum",
+            "velocity_aggregation": "mean",
+        },
     }
     return train_loader, val_loader, test_loader, x_data.shape[-1], stats
