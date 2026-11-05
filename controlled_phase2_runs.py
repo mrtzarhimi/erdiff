@@ -254,6 +254,7 @@ def main():
     source_file = args.source_file or reference.get("source_file") or Path(source_data).name
 
     if args.protocol in ("source_self", "synthetic"):
+        shared_protocol_root = Path(args.output_root) / args.protocol
         child_reference = (derive_source_self_reference(reference, resolved)
                            if args.protocol == "source_self" else resolved)
         child_ref_path = out / "protocol_reference.json"
@@ -265,9 +266,9 @@ def main():
                        "--reference_run", str(child_ref_path)]
             _append_config(command, config)
             if config.get("alignment_noise_mode") == "fixed_bank":
-                command.extend(("--noise_bank_path", str(Path(args.output_root).parent / "shared_noise_bank.pt")))
+                command.extend(("--noise_bank_path", str(shared_protocol_root / "shared_noise_bank.pt")))
             if config.get("gradient_balance") == "source_calibrated":
-                command.extend(("--gradient_calibration_path", str(Path(args.output_root).parent / "shared_source_gradient_calibration.json")))
+                command.extend(("--gradient_calibration_path", str(shared_protocol_root / "shared_source_gradient_calibration.json")))
         else:
             command = [sys.executable, "source_synthetic_checks.py",
                        "--source_checkpoint", str(source_checkpoint), "--source_data_path", source_data,
@@ -290,9 +291,9 @@ def main():
             if config.get("log_component_gradients"):
                 command.append("--log_component_gradients")
             if config.get("alignment_noise_mode") == "fixed_bank":
-                command.extend(("--noise_bank_path", str(Path(args.output_root).parent / "shared_synthetic_noise_bank.pt")))
+                command.extend(("--noise_bank_path", str(shared_protocol_root / "shared_synthetic_noise_bank.pt")))
             if config.get("gradient_balance") == "source_calibrated":
-                command.extend(("--gradient_calibration_path", str(Path(args.output_root).parent / "shared_synthetic_gradient_calibration.json")))
+                command.extend(("--gradient_calibration_path", str(shared_protocol_root / "shared_synthetic_gradient_calibration.json")))
             if config.get("alignment_noise_mode") == "fixed_bank":
                 command.extend(("--alignment_noise_mode", "fixed_bank", "--noise_seed", "42",
                                 "--noise_bank_replicates", str(config.get("noise_bank_replicates", 8))))
