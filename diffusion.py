@@ -258,14 +258,16 @@ def mla_loss(
     time_min=None,
     time_max=None,
     fixed_time=None,
+    noise=None,
+    timesteps=None,
 ) -> torch.Tensor:
     """
     Phase 2: Maximum Likelihood Alignment (MLA) Loss (Equation 12 & Equation 26).
     The diffusion model is FROZEN. The gradient flows back through z_t into z_0_target (and the encoder).
     """
     batch_size = z_0_target.size(0)
-    t = scheduler.sample_timesteps(batch_size, z_0_target.device, time_min, time_max, fixed_time)
-    eps = torch.randn_like(z_0_target)
+    t = timesteps if timesteps is not None else scheduler.sample_timesteps(batch_size, z_0_target.device, time_min, time_max, fixed_time)
+    eps = noise if noise is not None else torch.randn_like(z_0_target)
 
     return fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps)
 
@@ -333,6 +335,8 @@ def total_alignment_loss(
     mla_t_min=None,
     mla_t_max=None,
     mla_fixed_t=None,
+    mla_noise=None,
+    mla_timesteps=None,
 ) -> torch.Tensor:
     """
     Total Phase 2 Alignment Loss:
@@ -340,7 +344,8 @@ def total_alignment_loss(
     """
     if not 0.0 <= alpha <= 1.0:
         raise ValueError("alpha must be between 0 and 1 for the paper's loss mixture.")
-    loss_mla = mla_loss(diffusion_model, scheduler, z_target, mla_t_min, mla_t_max, mla_fixed_t)
+    loss_mla = mla_loss(diffusion_model, scheduler, z_target, mla_t_min, mla_t_max,
+                        mla_fixed_t, mla_noise, mla_timesteps)
     loss_shd = sinkhorn_loss(z_source, z_target, epsilon=ot_epsilon, num_iters=sinkhorn_iters)
     total = (1.0 - alpha) * loss_mla + alpha * loss_shd
     if return_components:

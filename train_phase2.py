@@ -10,6 +10,9 @@ from vae import SequentialVAE, trajectory_smoothness_loss, sample_latent_posteri
 from train_phase1 import evaluate_phase1
 from checkpoint_provenance import file_sha256
 from phase2_freeze_guard import FrozenDiffusionGuard
+from alignment_noise_bank import AlignmentNoiseBank
+from neuron_input_mapping import NeuronInputMap
+from alignment_gradient_diagnostics import component_gradient_report, calibrate_source_gradient_scale
 from diffusion import (
     LatentDiffusionModel,
     VPSDEScheduler,
@@ -56,12 +59,14 @@ def extract_source_latent_bank(vae: SequentialVAE, source_loader, device: torch.
     vae.eval()
     source_means = []
     source_logvars = []
+    source_trial_ids = []
     for batch in source_loader:
         spikes = batch["spikes"].to(device)
         mu, logvar = vae.encoder(spikes)
         source_means.append(mu)
         source_logvars.append(logvar)
-    return torch.cat(source_means, dim=0), torch.cat(source_logvars, dim=0)
+        source_trial_ids.append(batch["trial_id"])
+    return torch.cat(source_means, dim=0), torch.cat(source_logvars, dim=0), torch.cat(source_trial_ids)
 
 
 @torch.no_grad()
@@ -137,6 +142,11 @@ def train_epoch_phase2(
     mla_variance_floor: float = 0.9,
     mla_variance_scope: str = "batch",
     variance_pool_spikes=None,
+    noise_bank=None,
+    noise_replicate=0,
+    gradient_balance="none",
+    ot_scale=1.0,
+    log_component_gradients=False,
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
@@ -153,7 +163,7 @@ def train_epoch_phase2(
     total_variance_contribution = 0.0
     total_grad_norm = 0.0
     clipped_steps = 0
-    source_mu, source_logvar = source_latents_bank
+    source_mu, source_logvar, source_trial_ids = source_latents_bank
     num_source_samples = source_mu.size(0)
 
     for batch in target_loader:
@@ -164,11 +174,27 @@ def train_epoch_phase2(
 
         # Algorithm 2 samples target latents from the encoder posterior.
         mu_t, logvar_t = vae.encoder(target_spikes)
-        z_target = sample_latent_posterior(mu_t, logvar_t)
+        target_noise = source_noise = mla_noise = mla_times = None
+        if noise_bank is None:
+            z_target = sample_latent_posterior(mu_t, logvar_t)
+        else:
+            target_noise = noise_bank.get("target", batch["trial_id"], noise_replicate,
+                                          mu_t.shape[1], mu_t.shape[2], device)
+            z_target = sample_latent_posterior(mu_t, logvar_t, target_noise.posterior_eta)
 
         # 2. Sample matching batch of source latents for Sinkhorn regularizer
         perm = torch.randperm(num_source_samples, device=device)[:batch_size]
-        z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm])
+        if noise_bank is None:
+            z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm])
+        else:
+            source_noise = noise_bank.get("source", source_trial_ids[perm], noise_replicate,
+                                          source_mu.shape[1], source_mu.shape[2], device)
+            z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm], source_noise.posterior_eta)
+            low = scheduler.t_min if mla_t_min is None else mla_t_min
+            high = scheduler.T if mla_t_max is None else mla_t_max
+            mla_times = (torch.full_like(target_noise.uniform_time, mla_fixed_t) if mla_fixed_t is not None
+                         else target_noise.uniform_time * (high - low) + low)
+            mla_noise = target_noise.diffusion_eps
 
         # 3. Compute paper MLA + regularized OT; smoothness is an optional variant.
         loss_align, loss_mla, loss_ot = total_alignment_loss(
@@ -183,8 +209,14 @@ def train_epoch_phase2(
             mla_t_min=mla_t_min,
             mla_t_max=mla_t_max,
             mla_fixed_t=mla_fixed_t,
+            mla_noise=mla_noise,
+            mla_timesteps=mla_times,
         )
-        loss = loss_align
+        loss = (1.0 - alpha) * loss_mla + alpha * ot_scale * loss_ot
+        if log_component_gradients:
+            component_gradient_report({"mla": loss_mla, "ot": loss_ot},
+                                      tuple(vae.encoder.read_in.parameters()),
+                                      {"mla": 1.0 - alpha, "ot": alpha * ot_scale})
         variance_value = 0.0
         variance_contribution = 0.0
         if mla_variance_weight > 0 and alpha < 1.0:
@@ -256,6 +288,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Optional read-in weight decay variant")
     parser.add_argument("--epochs", type=int, default=150, help="Alignment epochs")
     parser.add_argument("--frozen_check", choices=("final", "every_epoch"), default="every_epoch")
+    parser.add_argument("--alignment_noise_mode", choices=("resampled", "fixed_bank"), default="resampled")
+    parser.add_argument("--noise_seed", type=int, default=42)
+    parser.add_argument("--noise_bank_replicates", type=int, default=8)
+    parser.add_argument("--log_component_gradients", action="store_true")
     parser.add_argument("--augment_mult", type=int, default=3, help="Target data repetition when --augment_target is enabled")
     parser.add_argument("--augment_target", action="store_true", help="Experimental variant: augment target adaptation spikes")
     parser.add_argument("--readin_init", choices=("source_or_random", "ridge"), default="source_or_random",
@@ -391,6 +427,8 @@ def main():
     # 3. Precompute Source Latent Bank
     print("Pre-computing source domain latent bank...")
     source_latents_bank = extract_source_latent_bank(vae, clean_source_loader, device)
+    noise_bank = (AlignmentNoiseBank(args.noise_seed, args.noise_bank_replicates)
+                  if args.alignment_noise_mode == "fixed_bank" else None)
     source_variance = None
     variance_pool_spikes = None
     if args.mla_variance_weight > 0 and args.alpha < 1.0:
@@ -506,6 +544,9 @@ def main():
             mla_variance_floor=args.mla_variance_floor,
             mla_variance_scope=args.mla_variance_scope,
             variance_pool_spikes=variance_pool_spikes,
+            noise_bank=noise_bank,
+            noise_replicate=(epoch - 1) % args.noise_bank_replicates,
+            log_component_gradients=args.log_component_gradients,
         )
         if args.frozen_check == "every_epoch":
             diffusion_guard.verify((alignment_optimizer,))
@@ -573,6 +614,11 @@ def main():
                 "batch_size": args.batch_size,
                 "batch_sampler": "seeded_balanced_shuffle",
                 "optimizer": "Adam",
+                "alignment_noise_mode": args.alignment_noise_mode,
+                "noise_seed": args.noise_seed,
+                "noise_bank_replicates": args.noise_bank_replicates,
+                "log_component_gradients": args.log_component_gradients,
+                "gradient_balance": "none",
             },
         },
         save_path,
