@@ -142,6 +142,11 @@ def train_epoch_phase2(
     diffusion_model.eval()        # Frozen score network
 
     total_loss = 0.0
+    total_mla = 0.0
+    total_ot = 0.0
+    total_smooth = 0.0
+    total_grad_norm = 0.0
+    clipped_steps = 0
     source_mu, source_logvar = source_latents_bank
     num_source_samples = source_mu.size(0)
 
@@ -160,7 +165,7 @@ def train_epoch_phase2(
         z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm])
 
         # 3. Compute paper MLA + regularized OT; smoothness is an optional variant.
-        loss_align = total_alignment_loss(
+        loss_align, loss_mla, loss_ot = total_alignment_loss(
             diffusion_model=diffusion_model,
             scheduler=scheduler,
             z_target=z_target,
@@ -168,19 +173,37 @@ def train_epoch_phase2(
             alpha=alpha,
             ot_epsilon=ot_epsilon,
             sinkhorn_iters=sinkhorn_iters,
+            return_components=True,
         )
         loss = loss_align
+        smooth_value = 0.0
         if smooth_weight:
-            loss = loss + smooth_weight * trajectory_smoothness_loss(mu_t)
+            loss_smooth = trajectory_smoothness_loss(mu_t)
+            smooth_value = loss_smooth.item()
+            loss = loss + smooth_weight * loss_smooth
 
         # 4. Update ONLY encoder.read_in
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(vae.encoder.read_in.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(vae.encoder.read_in.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
+        total_mla += loss_mla.item()
+        total_ot += loss_ot.item()
+        total_smooth += smooth_value
+        total_grad_norm += grad_norm.item()
+        clipped_steps += int(grad_norm.item() > 1.0)
 
-    return total_loss / len(target_loader)
+    batches = len(target_loader)
+    return {
+        "total": total_loss / batches,
+        "mla": total_mla / batches,
+        "ot": total_ot / batches,
+        "smooth": total_smooth / batches,
+        "grad_norm": total_grad_norm / batches,
+        "clipped_steps": clipped_steps,
+        "updates": batches,
+    }
 
 
 def main():
@@ -201,7 +224,8 @@ def main():
     parser.add_argument("--readin_init", choices=("source_or_random", "ridge"), default="source_or_random",
                         help="Initialize equal-width read-ins from source; use random or ridge for changed neuron counts")
     parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off weighting Sinkhorn loss")
-    parser.add_argument("--ot_epsilon", type=float, default=0.1, help="Entropy weight for full-trajectory transport")
+    parser.add_argument("--ot_epsilon", type=float, default=None,
+                        help="Entropy weight for full-trajectory transport; default preserves the former per-element temperature")
     parser.add_argument("--sinkhorn_iters", type=int, default=100, help="Log-domain transport scaling iterations")
     parser.add_argument("--smooth_weight", type=float, default=0.0, help="Optional trajectory-smoothness variant; paper default is zero")
     args = parser.parse_args()
@@ -251,6 +275,9 @@ def main():
     # 2. Restore Source Models from Phase 1
     latent_dim = checkpoint["latent_dim"]
     hidden_dim = checkpoint["hidden_dim"]
+    if args.ot_epsilon is None:
+        args.ot_epsilon = 0.1 * args.seq_len * latent_dim
+    print(f"Transport entropy weight: {args.ot_epsilon:g}")
 
     vae = SequentialVAE(
         n_neurons=n_src_neurons,
@@ -297,14 +324,14 @@ def main():
     )
     scheduler = VPSDEScheduler()
 
-    # Save the pre-alignment state for an unbiased direct-transfer comparison.
+    # Save the initialization for a paired, pre-alignment target baseline.
     unaligned_read_in_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
 
     save_path = os.path.join(args.save_dir, "phase2_aligned_target_model.pt")
 
     print("\nStarting Maximum Likelihood Alignment (Phase 2)...")
     for epoch in range(1, args.epochs + 1):
-        align_loss = train_epoch_phase2(
+        align_metrics = train_epoch_phase2(
             vae=vae,
             diffusion_model=diffusion_model,
             scheduler=scheduler,
@@ -321,7 +348,11 @@ def main():
         if epoch % 10 == 0 or epoch == args.epochs:
             print(
                 f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
-                f"Alignment Loss: {align_loss:.4f}"
+                f"Alignment Loss: {align_metrics['total']:.4f} | "
+                f"MLA: {align_metrics['mla']:.4f} | OT: {align_metrics['ot']:.4f} | "
+                f"Smooth: {align_metrics['smooth']:.4f} | "
+                f"Read-in grad: {align_metrics['grad_norm']:.4f} | "
+                f"Clipped: {align_metrics['clipped_steps']}/{align_metrics['updates']}"
             )
 
     torch.save(
@@ -332,6 +363,7 @@ def main():
             "velocity_mean": checkpoint_velocity_stats["velocity_mean"],
             "velocity_std": checkpoint_velocity_stats["velocity_std"],
             "alignment_epochs": args.epochs,
+            "alignment_updates": args.epochs * len(tgt_train_loader if args.augment_target else clean_target_loader),
             "split_indices": target_data_metadata["split_indices"],
             "split_seed": target_data_metadata["split_seed"],
             "alignment_config": {

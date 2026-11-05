@@ -302,11 +302,17 @@ def total_alignment_loss(
     alpha: float = 0.5,
     ot_epsilon: float = 0.1,
     sinkhorn_iters: int = 100,
+    return_components: bool = False,
 ) -> torch.Tensor:
     """
     Total Phase 2 Alignment Loss:
       L = (1 - alpha) * L_MLA + alpha * L_SHD
     """
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be between 0 and 1 for the paper's loss mixture.")
     loss_mla = mla_loss(diffusion_model, scheduler, z_target)
     loss_shd = sinkhorn_loss(z_source, z_target, epsilon=ot_epsilon, num_iters=sinkhorn_iters)
-    return (1.0 - alpha) * loss_mla + alpha * loss_shd
+    total = (1.0 - alpha) * loss_mla + alpha * loss_shd
+    if return_components:
+        return total, loss_mla, loss_shd
+    return total

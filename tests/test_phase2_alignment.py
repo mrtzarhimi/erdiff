@@ -1,4 +1,5 @@
 import torch
+import math
 from torch.utils.data import DataLoader
 
 from dataloader import NHPDataset
@@ -35,3 +36,12 @@ def test_transport_uses_full_squared_trajectory_cost_and_gradient():
 
     assert torch.allclose(loss, torch.tensor(4.0))
     assert torch.allclose(gradient, torch.tensor([[[4.0, 0.0]]]))
+
+
+def test_transport_value_includes_entropy_term():
+    source = torch.zeros(2, 1, 1)
+    target = torch.zeros(2, 1, 1)
+
+    loss = sinkhorn_loss(source, target, epsilon=2.0)
+
+    assert torch.allclose(loss, torch.tensor(-2.0 * math.log(4)), atol=1e-6)

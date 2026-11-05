@@ -114,7 +114,7 @@ def main():
     parser.add_argument("--phase2_epochs", type=int, default=150, help="Epochs for Phase 2 alignment per day")
     parser.add_argument("--phase2_lr", type=float, default=0.001, help="Target read-in learning rate")
     parser.add_argument("--phase2_alpha", type=float, default=0.5, help="Paper MLA/transport mixing weight")
-    parser.add_argument("--phase2_ot_epsilon", type=float, default=0.1, help="Transport entropy weight")
+    parser.add_argument("--phase2_ot_epsilon", type=float, default=None, help="Optional transport entropy weight")
     parser.add_argument("--phase2_smooth_weight", type=float, default=0.0, help="Optional smoothness variant")
     parser.add_argument("--phase2_readin_init", choices=("source_or_random", "ridge"), default="source_or_random")
     parser.add_argument("--phase2_augment_target", action="store_true", help="Experimental target-spike augmentation")
@@ -196,10 +196,11 @@ def main():
             "--epochs", str(args.phase2_epochs),
             "--augment_mult", "3",
             "--alpha", str(args.phase2_alpha),
-            "--ot_epsilon", str(args.phase2_ot_epsilon),
             "--smooth_weight", str(args.phase2_smooth_weight),
             "--readin_init", args.phase2_readin_init,
         ]
+        if args.phase2_ot_epsilon is not None:
+            cmd_p2.extend(("--ot_epsilon", str(args.phase2_ot_epsilon)))
         if args.phase2_augment_target:
             cmd_p2.append("--augment_target")
         subprocess.run(cmd_p2, check=True)
