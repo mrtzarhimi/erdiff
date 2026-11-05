@@ -279,6 +279,15 @@ def main():
     print(f"Source neurons: {n_src_neurons} | Target neurons: {n_tgt_neurons}")
     clean_source_loader = clean_training_view(src_train_loader, args.batch_size)
     clean_target_loader = clean_training_view(tgt_train_loader, args.batch_size)
+    from phase2_sampling import make_alignment_loader
+    optimization_dataset = tgt_train_loader.dataset if args.augment_target else clean_target_loader.dataset
+    alignment_loader = make_alignment_loader(optimization_dataset, args.batch_size, args.seed)
+    batch_count = len(alignment_loader)
+    small_batch, extra = divmod(len(optimization_dataset), batch_count)
+    print(
+        f"Adaptation batches: {batch_count}, sizes {small_batch}–{small_batch + bool(extra)} | "
+        f"all {len(optimization_dataset)} samples visited once per shuffled epoch"
+    )
 
     # 2. Restore Source Models from Phase 1
     latent_dim = checkpoint["latent_dim"]
@@ -351,7 +360,7 @@ def main():
             vae=vae,
             diffusion_model=diffusion_model,
             scheduler=scheduler,
-            target_loader=tgt_train_loader if args.augment_target else clean_target_loader,
+            target_loader=alignment_loader,
             source_latents_bank=source_latents_bank,
             optimizer=alignment_optimizer,
             device=device,
@@ -386,7 +395,7 @@ def main():
             "source_self_check": args.source_self_check,
             "source_self_history": source_self_history,
             "diffusion_training": noise_config,
-            "alignment_updates": args.epochs * len(tgt_train_loader if args.augment_target else clean_target_loader),
+            "alignment_updates": args.epochs * len(alignment_loader),
             "split_indices": target_data_metadata["split_indices"],
             "split_seed": target_data_metadata["split_seed"],
             "alignment_config": {
@@ -401,6 +410,7 @@ def main():
                 "readin_init": args.readin_init,
                 "seed": args.seed,
                 "batch_size": args.batch_size,
+                "batch_sampler": "seeded_balanced_shuffle",
                 "optimizer": "Adam",
             },
         },
