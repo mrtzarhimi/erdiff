@@ -27,12 +27,17 @@ class NHPDataset(Dataset):
         augment_multiplier: int = 5,
         noise_factor: float = 0.08,
         include_behavior: bool = True,
+        trial_ids=None,
     ):
         self.spikes = spikes
         self.velocities = velocities
         self.targets = targets
         self.is_train = is_train
         self.include_behavior = include_behavior
+        self.trial_ids = (torch.arange(spikes.shape[0], dtype=torch.long)
+                          if trial_ids is None else torch.as_tensor(trial_ids, dtype=torch.long))
+        if self.trial_ids.numel() != spikes.shape[0]:
+            raise ValueError("trial_ids must identify each underlying trial exactly once.")
         self.multiplier = augment_multiplier if is_train else 1
         self.noise_transform = AddGaussianNoise(factor=noise_factor)
 
@@ -47,7 +52,7 @@ class NHPDataset(Dataset):
             spk = self.noise_transform(spk)
             spk = torch.clamp(spk, min=0.0)
 
-        sample = {"spikes": spk}
+        sample = {"spikes": spk, "trial_id": self.trial_ids[base_idx]}
         if self.include_behavior:
             sample["velocity"] = self.velocities[base_idx].clone()
             sample["target"] = self.targets[base_idx]
@@ -340,6 +345,7 @@ def get_nhp_dataloaders(
         x_train, y_train, t_train, is_train=True, augment_multiplier=augment_multiplier,
         include_behavior=include_behavior,
         noise_factor=train_noise_factor,
+        trial_ids=train_idx,
     )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
@@ -349,7 +355,8 @@ def get_nhp_dataloaders(
         t_val = targets[val_idx]
         y_val = (y_val - y_mean) / y_std
         val_dataset = NHPDataset(
-            x_val, y_val, t_val, is_train=False, include_behavior=include_behavior
+            x_val, y_val, t_val, is_train=False, include_behavior=include_behavior,
+            trial_ids=val_idx,
         )
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
@@ -359,7 +366,8 @@ def get_nhp_dataloaders(
         t_test = targets[test_idx]
         y_test = (y_test - y_mean) / y_std
         test_dataset = NHPDataset(
-            x_test, y_test, t_test, is_train=False, include_behavior=include_behavior
+            x_test, y_test, t_test, is_train=False, include_behavior=include_behavior,
+            trial_ids=test_idx,
         )
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 

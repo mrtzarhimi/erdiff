@@ -43,7 +43,7 @@ def clean_training_view(loader, batch_size: int):
     dataset = loader.dataset
     return DataLoader(
         NHPDataset(dataset.spikes, dataset.velocities, dataset.targets,
-                   is_train=False, include_behavior=False),
+                   is_train=False, include_behavior=False, trial_ids=dataset.trial_ids),
         batch_size=batch_size, shuffle=False, drop_last=False,
     )
 
