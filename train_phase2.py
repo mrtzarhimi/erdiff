@@ -8,6 +8,8 @@ from torch.utils.data import DataLoader
 from dataloader import NHPDataset, get_nhp_dataloaders
 from vae import SequentialVAE, trajectory_smoothness_loss, sample_latent_posterior
 from train_phase1 import evaluate_phase1
+from checkpoint_provenance import file_sha256
+from phase2_freeze_guard import FrozenDiffusionGuard
 from diffusion import (
     LatentDiffusionModel,
     VPSDEScheduler,
@@ -253,6 +255,7 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for target read-in probing")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Optional read-in weight decay variant")
     parser.add_argument("--epochs", type=int, default=150, help="Alignment epochs")
+    parser.add_argument("--frozen_check", choices=("final", "every_epoch"), default="every_epoch")
     parser.add_argument("--augment_mult", type=int, default=3, help="Target data repetition when --augment_target is enabled")
     parser.add_argument("--augment_target", action="store_true", help="Experimental variant: augment target adaptation spikes")
     parser.add_argument("--readin_init", choices=("source_or_random", "ridge"), default="source_or_random",
@@ -301,7 +304,14 @@ def main():
     print(f"Using device: {device}")
 
     # 1. Load Source and Target Data
+    source_fingerprint = file_sha256(args.source_checkpoint)
     checkpoint = torch.load(args.source_checkpoint, map_location=device)
+    print(f"Source checkpoint: {os.path.realpath(args.source_checkpoint)} | SHA256: {source_fingerprint}")
+    print(
+        f"Source selected epoch: {checkpoint.get('epoch', 'unknown')} | "
+        f"validation R2: {checkpoint.get('best_r2', 'unknown')} | "
+        f"training seed: {checkpoint.get('training_seed', 'unknown')}"
+    )
     noise_config = checkpoint.get("diffusion_training", {})
     if noise_config.get("latent_distribution") != "posterior_sample":
         raise ValueError(
@@ -411,6 +421,8 @@ def main():
 
     for param in diffusion_model.parameters():
         param.requires_grad = False
+    diffusion_model.eval()
+    diffusion_guard = FrozenDiffusionGuard(diffusion_model)
 
     alignment_optimizer = optim.Adam(
         vae.encoder.read_in.parameters(),
@@ -495,6 +507,8 @@ def main():
             mla_variance_scope=args.mla_variance_scope,
             variance_pool_spikes=variance_pool_spikes,
         )
+        if args.frozen_check == "every_epoch":
+            diffusion_guard.verify((alignment_optimizer,))
 
         if epoch % 10 == 0 or epoch == args.epochs:
             print(
@@ -517,6 +531,7 @@ def main():
         ):
             diagnostics.record(epoch, vae, diffusion_model, scheduler, device, args.batch_size)
 
+    diffusion_guard.verify((alignment_optimizer,))
     torch.save(
         {
             "unaligned_read_in_state": unaligned_read_in_state,
@@ -525,8 +540,13 @@ def main():
             "velocity_mean": checkpoint_velocity_stats["velocity_mean"],
             "velocity_std": checkpoint_velocity_stats["velocity_std"],
             "alignment_epochs": args.epochs,
+            "diffusion_frozen_verified": True,
             "source_trial_variance": None if source_variance is None else source_variance.cpu(),
             "variance_pool_trials": len(clean_target_loader.dataset),
+            "source_checkpoint_sha256": source_fingerprint,
+            "source_checkpoint_path": os.path.realpath(args.source_checkpoint),
+            "source_epoch": checkpoint.get("epoch"),
+            "source_validation_r2": checkpoint.get("best_r2"),
             "source_self_check": args.source_self_check,
             "source_self_history": source_self_history,
             "diffusion_training": noise_config,
