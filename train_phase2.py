@@ -537,6 +537,12 @@ def main():
         n_heads=4,
     ).to(device)
     diffusion_model.load_state_dict(checkpoint["dm_state_dict"])
+    diffusion_guard = FrozenDiffusionGuard(diffusion_model)
+    freeze_failure_path = os.path.join(args.save_dir, "phase2_freeze_failure.json")
+    diffusion_guard.verify_or_record_failure(
+        failure_path=freeze_failure_path,
+        context={"stage": "after_phase1_load", "source_checkpoint": os.path.realpath(args.source_checkpoint)},
+    )
 
     # 3. Precompute Source Latent Bank
     print("Pre-computing source domain latent bank...")
@@ -571,15 +577,14 @@ def main():
     vae.encoder.read_in = warm_read_in
     vae.freeze_for_alignment()
 
-    for param in diffusion_model.parameters():
-        param.requires_grad = False
-    diffusion_model.eval()
-    diffusion_guard = FrozenDiffusionGuard(diffusion_model)
-
     alignment_optimizer = optim.Adam(
         vae.encoder.read_in.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
+    )
+    diffusion_guard.verify_or_record_failure(
+        (alignment_optimizer,), failure_path=freeze_failure_path,
+        context={"stage": "before_phase2_optimization", "target_session": os.path.realpath(args.target_data_path)},
     )
     scheduler = VPSDEScheduler(
         beta_min=noise_config["beta_min"], beta_max=noise_config["beta_max"],
@@ -667,7 +672,12 @@ def main():
             log_component_gradients=args.log_component_gradients,
         )
         if args.frozen_check == "every_epoch":
-            diffusion_guard.verify((alignment_optimizer,))
+            diffusion_guard.verify_or_record_failure(
+                (alignment_optimizer,), failure_path=freeze_failure_path,
+                context={"stage": "epoch_end", "epoch": epoch,
+                         "source_checkpoint": os.path.realpath(args.source_checkpoint),
+                         "target_session": os.path.realpath(args.target_data_path)},
+            )
         completed_updates += align_metrics["updates"]
         sample_exposures += align_metrics["sample_exposures"]
         full_variance_forwards += align_metrics["full_variance_forwards"]
@@ -694,7 +704,12 @@ def main():
         ):
             diagnostics.record(epoch, vae, diffusion_model, scheduler, device, args.batch_size)
 
-    diffusion_guard.verify((alignment_optimizer,))
+    diffusion_guard.verify_or_record_failure(
+        (alignment_optimizer,), failure_path=freeze_failure_path,
+        context={"stage": "final", "epoch": args.epochs,
+                 "source_checkpoint": os.path.realpath(args.source_checkpoint),
+                 "target_session": os.path.realpath(args.target_data_path)},
+    )
     unresolved = []
     if resolved_reference is None:
         unresolved.append("reference_run_not_supplied")

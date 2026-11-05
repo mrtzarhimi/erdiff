@@ -53,11 +53,13 @@
 
 **Interfaces:** `FrozenDiffusionGuard(model)` stores an independent CPU snapshot of every state_dict entry; `verify(optimizers: list) -> dict` checks exact state equality, requires_grad=false, no parameter gradients, eval mode, and optimizer exclusion. `--frozen_check final|every_epoch` controls frequency, not whether freezing is required.
 
-- [ ] Write tests for unchanged state, accidental optimizer inclusion, buffer mutation, and preserved gradient from denoiser output to its input while denoiser parameter gradients stay absent.
-- [ ] Apply freeze/guard after loading the Phase 1 state and before optimization. Final verification is mandatory even when epoch checks are enabled.
-- [ ] On a failed invariant, stop and save failure metadata rather than emitting successful benchmark metrics.
+- [x] Write tests for unchanged state, accidental optimizer inclusion, buffer mutation, and preserved gradient from denoiser output to its input while denoiser parameter gradients stay absent.
+- [x] Apply freeze/guard after loading the Phase 1 state and before optimization. Final verification is mandatory even when epoch checks are enabled.
+- [x] On a failed invariant, stop and save failure metadata rather than emitting successful benchmark metrics.
 - [ ] When authorized: `pytest tests/test_phase2_freeze_guard.py -q`; expected tests pass. No execution in this implementation pass.
-- [ ] Commit: `fix: verify frozen diffusion state throughout Phase 2`.
+- [x] Commit: `fix: verify frozen diffusion state throughout Phase 2`.
+
+**Execution note:** freeze checks and failure reporting are integrated in the real Phase 2 and source-synthetic paths. The test file is written but remains unrun under the user's no-execution instruction.
 
 ### Task 3: Add a trial-indexed fixed Gaussian bank
 

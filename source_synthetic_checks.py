@@ -15,6 +15,7 @@ from decoder_models import compute_r2_score, compute_rmse
 from diffusion import LatentDiffusionModel, VPSDEScheduler
 from mla_diagnostics import MLADiagnostics, variance_summary
 from mla_stabilization import source_trial_variance
+from phase2_freeze_guard import FrozenDiffusionGuard
 from phase2_sampling import make_alignment_loader
 from synthetic_shifts import apply_shift, make_shift, oracle_readin_weight, validation_development_split
 from train_phase2 import clean_training_view, extract_source_latent_bank, set_seed, train_epoch_phase2
@@ -110,8 +111,11 @@ def main():
         num_blocks=4, n_heads=4,
     ).to(device)
     denoiser.load_state_dict(checkpoint["dm_state_dict"])
-    denoiser.requires_grad_(False)
-    denoiser.eval()
+    denoiser_guard = FrozenDiffusionGuard(denoiser)
+    denoiser_guard.verify_or_record_failure(
+        failure_path=str(output / "phase2_freeze_failure.json"),
+        context={"stage": "after_phase1_load", "source_checkpoint": str(Path(args.source_checkpoint).resolve())},
+    )
     noise = checkpoint["diffusion_training"]
     scheduler = VPSDEScheduler(noise["beta_min"], noise["beta_max"], noise["T"], noise["t_min"])
     probe_times = [t for t in (0.01, 0.05, 0.2, 0.5, 0.9) if scheduler.t_min <= t <= scheduler.T]
@@ -162,6 +166,12 @@ def main():
             pool = adaptation_spikes.to(device) if args.mla_variance_scope == "full_train" else None
             run_dir = output / f"{kind}_w{weight:g}"
             run_dir.mkdir(parents=True, exist_ok=True)
+            failure_path = run_dir / "phase2_freeze_failure.json"
+            denoiser_guard.verify_or_record_failure(
+                (optimizer,), failure_path=str(failure_path),
+                context={"stage": "before_synthetic_alignment", "shift": kind,
+                         "variance_weight": weight, "seed": args.seed},
+            )
             before = metrics(predict(model, evaluation_spikes, device, args.batch_size), evaluation_velocity, checkpoint)
             variance_before = variance_summary(model, adaptation_spikes, device, args.batch_size)
             diagnostics = None
@@ -183,12 +193,22 @@ def main():
                     mla_variance_floor=args.mla_variance_floor, mla_variance_scope=args.mla_variance_scope,
                     variance_pool_spikes=pool,
                 )
+                denoiser_guard.verify_or_record_failure(
+                    (optimizer,), failure_path=str(failure_path),
+                    context={"stage": "synthetic_epoch_end", "epoch": epoch,
+                             "shift": kind, "variance_weight": weight, "seed": args.seed},
+                )
                 if epoch in (1, 5) or epoch % 10 == 0 or epoch == args.epochs:
                     current = metrics(predict(model, evaluation_spikes, device, args.batch_size), evaluation_velocity, checkpoint)
                     history.append({"epoch": epoch, "losses": losses, "evaluation": current})
                     print(f"{kind}, weight={weight:g}, epoch={epoch}: R2={current['r2']:.2f}% | loss={losses['total']:.4f}")
                     if diagnostics is not None:
                         diagnostics.record(epoch, model, denoiser, scheduler, device, args.batch_size)
+            denoiser_guard.verify_or_record_failure(
+                (optimizer,), failure_path=str(failure_path),
+                context={"stage": "synthetic_final", "epoch": args.epochs,
+                         "shift": kind, "variance_weight": weight, "seed": args.seed},
+            )
             after = metrics(predict(model, evaluation_spikes, device, args.batch_size), evaluation_velocity, checkpoint)
             variance_after = variance_summary(model, adaptation_spikes, device, args.batch_size)
             row = {

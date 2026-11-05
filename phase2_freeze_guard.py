@@ -1,5 +1,9 @@
 """Runtime assertions that Phase 2 never changes the Phase 1 denoiser."""
 
+import json
+import os
+from datetime import datetime, timezone
+
 import torch
 
 
@@ -33,3 +37,31 @@ class FrozenDiffusionGuard:
             if not torch.equal(value.detach().cpu(), self.initial_state[key]):
                 raise RuntimeError(f"Frozen diffusion state changed during Phase 2: {key}")
         return {"frozen": True, "state_entries": len(current)}
+
+    def verify_or_record_failure(self, optimizers=(), failure_path=None, context=None):
+        """Verify the invariant and persist failure context before propagating it."""
+        try:
+            return self.verify(optimizers)
+        except RuntimeError as error:
+            if failure_path is not None:
+                record = {
+                    "status": "failed",
+                    "invariant": "phase2_diffusion_frozen",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "detected_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "context": context or {},
+                }
+                parent = os.path.dirname(os.path.realpath(failure_path))
+                os.makedirs(parent, exist_ok=True)
+                temporary_path = failure_path + ".tmp"
+                try:
+                    with open(temporary_path, "w", encoding="utf-8") as handle:
+                        json.dump(record, handle, indent=2, sort_keys=True)
+                        handle.write("\n")
+                    os.replace(temporary_path, failure_path)
+                except OSError as save_error:
+                    raise RuntimeError(
+                        f"{error}; additionally failed to save freeze-failure metadata: {save_error}"
+                    ) from error
+            raise
