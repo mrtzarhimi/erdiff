@@ -118,6 +118,42 @@ def evaluate_phase1(vae: SequentialVAE, loader, device: torch.device):
     return r2, rmse
 
 
+def inspect_source_timebase(file_path: str, seq_len: int):
+    """Report stored sample spacing without assuming that one sample is 20 ms."""
+    import mat73
+    import numpy as np
+
+    xds = mat73.loadmat(file_path)["xds"]
+    times = np.asarray(xds["time_frame"], dtype=np.float64).ravel()
+    deltas = np.diff(times)
+    valid_deltas = deltas[np.isfinite(deltas) & (deltas > 0)]
+    if valid_deltas.size == 0:
+        print("Time-frame spacing could not be determined from positive finite differences.")
+        return
+
+    median_dt = float(np.median(valid_deltas))
+    print(
+        f"Stored time_frame spacing: median={median_dt:.8g}, "
+        f"5th/95th percentiles={np.percentile(valid_deltas, [5, 95]).tolist()} "
+        f"(native time units); {seq_len} samples span approximately "
+        f"{(seq_len - 1) * median_dt:.8g} native time units."
+    )
+    print(
+        f"Raw signal shapes: spike_counts={np.shape(xds['spike_counts'])}, "
+        f"curs_v={np.shape(xds['curs_v'])}; target_dir present={xds.get('target_dir') is not None}."
+    )
+    go_cues = np.asarray(xds.get("trial_gocue_time", xds.get("trial_start_time")), dtype=np.float64).ravel()
+    if np.all(np.isnan(go_cues)):
+        go_cues = np.asarray(xds["trial_start_time"], dtype=np.float64).ravel()
+    if "trial_end_time" in xds:
+        trial_ends = np.asarray(xds["trial_end_time"], dtype=np.float64).ravel()
+        n_trials = min(len(go_cues), len(trial_ends))
+        durations = trial_ends[:n_trials] - go_cues[:n_trials]
+        durations = durations[np.isfinite(durations) & (durations > 0)]
+        if durations.size:
+            print(f"Go-cue to trial-end duration: median={np.median(durations):.8g} native time units.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: Source Domain Training (ERDiff)")
     parser.add_argument("--seed", type=int, default=42, help="Random state seed")
@@ -198,6 +234,7 @@ def main():
         )
 
     if args.inspect_data_only:
+        inspect_source_timebase(args.data_path, args.seq_len)
         print("Source data inspection complete; no model was trained.")
         return
 
