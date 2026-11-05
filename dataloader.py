@@ -165,7 +165,7 @@ def split_trial_indices(
     num_trials: int,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
-    seed: int = 42,
+    split_seed: int = 42,
     window_intervals=None,
 ):
     """Create a reproducible, disjoint train/validation/test trial split."""
@@ -179,7 +179,7 @@ def split_trial_indices(
     if val_size + test_size >= num_trials:
         raise ValueError("Split ratios leave no training trials; use more trials or smaller ratios.")
 
-    generator = torch.Generator().manual_seed(seed)
+    generator = torch.Generator().manual_seed(split_seed)
     if window_intervals is None:
         groups = [torch.tensor([i], dtype=torch.long) for i in range(num_trials)]
     else:
@@ -230,10 +230,11 @@ def get_nhp_dataloaders(
     batch_size: int = 64,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
-    seed: int = 42,
+    split_seed: int = 42,
     seq_len: int = 39,
     augment_multiplier: int = 5,
     velocity_stats=None,
+    split_indices=None,
     include_validation: bool = True,
     include_test: bool = True,
     include_behavior: bool = True,
@@ -241,13 +242,39 @@ def get_nhp_dataloaders(
     x_data, y_data, targets, window_intervals = load_nhp_session(file_path=file_path, seq_len=seq_len)
     num_trials = x_data.shape[0]
 
-    train_idx, val_idx, test_idx = split_trial_indices(
-        num_trials=num_trials,
-        val_ratio=val_ratio,
-        test_ratio=test_ratio,
-        seed=seed,
-        window_intervals=window_intervals,
-    )
+    if split_indices is None:
+        train_idx, val_idx, test_idx = split_trial_indices(
+            num_trials=num_trials,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            split_seed=split_seed,
+            window_intervals=window_intervals,
+        )
+    else:
+        try:
+            train_idx = torch.as_tensor(split_indices["train"], dtype=torch.long).cpu()
+            val_idx = torch.as_tensor(split_indices["validation"], dtype=torch.long).cpu()
+            test_idx = torch.as_tensor(split_indices["test"], dtype=torch.long).cpu()
+        except (KeyError, TypeError) as exc:
+            raise ValueError("split_indices must contain train, validation, and test indices.") from exc
+        all_indices = torch.cat((train_idx, val_idx, test_idx))
+        if (
+            all_indices.numel() != num_trials
+            or not torch.equal(torch.sort(all_indices).values, torch.arange(num_trials))
+        ):
+            raise ValueError(
+                "Saved split indices do not match the current extracted trials; "
+                "check preprocessing and session data consistency."
+            )
+        saved_intervals = torch.as_tensor(split_indices.get("window_intervals", []), dtype=torch.long).cpu()
+        if saved_intervals.shape != window_intervals.shape or not torch.equal(saved_intervals, window_intervals):
+            raise ValueError(
+                "Saved split windows do not match the current session extraction; "
+                "the test set cannot be reconstructed safely."
+            )
+        saved_session = split_indices.get("session_path")
+        if saved_session is not None and os.path.realpath(saved_session) != os.path.realpath(file_path):
+            raise ValueError("Saved split indices belong to a different session path.")
 
     x_train = x_data[train_idx]
     if include_behavior:
@@ -303,5 +330,13 @@ def get_nhp_dataloaders(
     stats = {
         "velocity_mean": y_mean.reshape(-1).detach().cpu(),
         "velocity_std": y_std.reshape(-1).detach().cpu(),
+        "split_indices": {
+            "train": train_idx.detach().cpu(),
+            "validation": val_idx.detach().cpu(),
+            "test": test_idx.detach().cpu(),
+            "window_intervals": window_intervals.detach().cpu(),
+            "session_path": os.path.realpath(file_path),
+        },
+        "split_seed": split_seed,
     }
     return train_loader, val_loader, test_loader, x_data.shape[-1], stats

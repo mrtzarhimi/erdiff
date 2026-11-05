@@ -101,6 +101,7 @@ def plot_cross_day_drift(df: pd.DataFrame, save_path: str):
 def main():
     parser = argparse.ArgumentParser(description="Run 11-Day Cross-Session Alignment Benchmark")
     parser.add_argument("--seed", type=int, default=42, help="Random state seed")
+    parser.add_argument("--split_seed", type=int, default=42, help="Fixed seed for trial partitions, independent of model seed")
     parser.add_argument("--data_dir", type=str, default="./data", help="Directory where .mat files are stored")
     parser.add_argument("--source_file", type=str, default="Chewie_20160928_001.mat", help="Source session file")
     parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="Model checkpoints directory")
@@ -131,6 +132,7 @@ def main():
         cmd_p1 = [
             "python", "train_phase1.py",
             "--seed", str(args.seed),
+            "--split_seed", str(args.split_seed),
             "--data_path", source_path,
             "--save_dir", args.checkpoints_dir,
             "--seq_len", str(args.seq_len),
@@ -176,6 +178,7 @@ def main():
         cmd_p2 = [
             "python", "train_phase2.py",
             "--seed", str(args.seed),
+            "--split_seed", str(args.split_seed),
             "--source_checkpoint", phase1_ckpt,
             "--source_data_path", source_path,
             "--target_data_path", target_path,
@@ -217,6 +220,7 @@ def main():
         summary_records.append({
             "target_session": target_file,
             "seed": args.seed,
+            "split_seed": int(res.get("Split seed", args.split_seed)),
             "test_trials": int(res.get("Test trials", 0)),
             "alignment_epochs": int(res.get("Alignment epochs", 0)),
             "days_elapsed": days_elapsed,

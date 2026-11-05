@@ -13,7 +13,7 @@ In brain-computer interface (BCI) decoding, raw neural population activities shi
 1. **Extraction (Phase 1):** Jointly trains a Sequential Variational Autoencoder (VAE), a kinematics behavior decoder, and a Diffusion Model (DM) over the source domain. The DM employs stacked **Spatio-Temporal Transformer Blocks (STBlocks)** to extract global trajectory dynamics and cross-dimensional correlations.
 2. **Recovery / Alignment (Phase 2):** Performs target-domain adaptation via **Maximum Likelihood Alignment (MLA)** and the configured Sinkhorn loss. Target behavior labels are excluded from adaptation and checkpoint selection; the final configured epoch is evaluated on a disjoint held-out test partition.
 
-Evaluation uses deterministic trial partitions, go-cue-relative input windows, source-training velocity normalization, and test-only target metrics. Overlapping windows are kept in the same partition, and spike smoothing is applied within each trial window.
+Evaluation uses saved deterministic trial partitions, go-cue-relative input windows, source-training velocity normalization, and test-only target metrics. `--split_seed` controls the partition independently of `--seed`, which controls model randomness. Checkpoints preserve their split indices and evaluation reuses them. Overlapping windows are kept in the same partition, and spike smoothing is applied within each trial window. Legacy checkpoints without split metadata must be regenerated.
 
 ---
 

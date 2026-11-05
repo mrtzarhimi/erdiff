@@ -123,6 +123,7 @@ def evaluate_phase1(vae: SequentialVAE, loader, device: torch.device):
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: Source Domain Training (ERDiff)")
     parser.add_argument("--seed", type=int, default=42, help="Random state seed")
+    parser.add_argument("--split_seed", type=int, default=42, help="Seed used only to define trial partitions")
     parser.add_argument("--data_path", type=str, required=True, help="Path to source session .mat file")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins per trial")
@@ -149,7 +150,7 @@ def main():
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         augment_multiplier=args.augment_mult,
-        seed=args.seed,
+        split_seed=args.split_seed,
     )
     print(f"Loaded source domain with {n_neurons} neurons across trials of length {args.seq_len}.")
 
@@ -217,6 +218,8 @@ def main():
                     "best_r2": best_val_r2,
                     "velocity_mean": velocity_stats["velocity_mean"],
                     "velocity_std": velocity_stats["velocity_std"],
+                    "split_indices": velocity_stats["split_indices"],
+                    "split_seed": velocity_stats["split_seed"],
                 },
                 save_path,
             )

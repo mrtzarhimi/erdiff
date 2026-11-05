@@ -153,14 +153,17 @@ def main():
             "Checkpoint is missing source-training velocity statistics; retrain Phase 1/2 "
             "before evaluating to avoid target-derived normalization."
         )
+    if "split_indices" not in aligned_ckpt:
+        raise ValueError("Aligned checkpoint is missing saved target trial splits; rerun Phase 2.")
 
     _, _, target_test_loader, n_tgt_neurons, _ = get_nhp_dataloaders(
         file_path=args.target_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
-        seed=args.seed,
         augment_multiplier=1,
         velocity_stats=velocity_stats,
+        split_seed=aligned_ckpt.get("split_seed", 42),
+        split_indices=aligned_ckpt["split_indices"],
         include_validation=False,
     )
 
@@ -239,6 +242,7 @@ def main():
         f.write(f"Seed: {args.seed}\n")
         f.write(f"Test trials: {len(target_test_loader.dataset)}\n")
         f.write(f"Alignment epochs: {aligned_ckpt.get('alignment_epochs', -1)}\n")
+        f.write(f"Split seed: {aligned_ckpt.get('split_seed', -1)}\n")
         f.write(f"Unaligned R2: {r2_unaligned:.4f}\n")
         f.write(f"Unaligned RMSE: {rmse_unaligned:.4f}\n")
         f.write(f"Aligned R2: {r2_aligned:.4f}\n")

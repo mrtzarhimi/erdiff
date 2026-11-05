@@ -77,3 +77,10 @@ Not run. User explicitly instructed “do not execute anything.” Repository an
 - **Regression checks: added, not run.** `tests/test_evaluation_protocol.py` covers deterministic/disjoint splits, keeping overlapping windows in one partition, cue-derived bounds, and velocity inverse scaling. TDD red/green execution was not possible under the no-execution constraint.
 
 These edits address evaluation leakage and scale bias, but they do not establish paper-level reproduction or prove runtime correctness. The trial window and within-trial smoothing changes are protocol decisions that should be compared against the official data pipeline when source data/code execution is authorized. The 4-bin neural lag and filtering to successful trials remain potential preprocessing choices to validate; success-only filtering conditions the evaluated population and must be reported as such. Cross-day orchestration still runs one seed at a time, so means/uncertainty across seeds are not produced automatically. The split code fails clearly if overlap grouping leaves fewer than three independent interval groups; whether the actual sessions satisfy this is unknown because no session data was read.
+
+## Split-seed correction (2026-11-05)
+
+- Added `--split_seed`, independent of the model RNG seed, to Phase 1, Phase 2, and cross-day orchestration.
+- Phase 1 checkpoints save source train/validation/test indices. Phase 2 reuses those source indices for the source latent bank and saves the target indices, split seed, extracted window intervals, and session path in its target checkpoint.
+- Both evaluation entry points now require and reuse the saved target indices. They validate that indices cover the current extracted trials exactly and that the saved window intervals and session path match; mismatches fail rather than silently rebuilding a test set.
+- Legacy checkpoints without saved splits must be recreated by rerunning Phase 1 and Phase 2. This correction was statically reviewed only; no pipeline or tests were executed.

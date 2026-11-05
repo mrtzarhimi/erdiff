@@ -152,6 +152,7 @@ def train_epoch_phase2(
 def main():
     parser = argparse.ArgumentParser(description="Phase 2: Target Domain Maximum Likelihood Alignment (ERDiff)")
     parser.add_argument("--seed", type=int, default=42, help="Random state seed")
+    parser.add_argument("--split_seed", type=int, default=42, help="Seed used only to define trial partitions")
     parser.add_argument("--source_checkpoint", type=str, required=True, help="Path to saved Phase 1 checkpoint (.pt)")
     parser.add_argument("--source_data_path", type=str, required=True, help="Path to source session .mat file")
     parser.add_argument("--target_data_path", type=str, required=True, help="Path to target session .mat file")
@@ -172,29 +173,32 @@ def main():
     print(f"Using device: {device}")
 
     # 1. Load Source and Target Data
-    src_train_loader, _, _, n_src_neurons, _ = get_nhp_dataloaders(
-        file_path=args.source_data_path,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        augment_multiplier=1,  # Clean source bank
-        seed=args.seed,
-    )
     checkpoint = torch.load(args.source_checkpoint, map_location=device)
+    if "split_indices" not in checkpoint or "split_seed" not in checkpoint:
+        raise ValueError("Source checkpoint is missing saved trial splits; retrain Phase 1.")
     if "velocity_mean" not in checkpoint or "velocity_std" not in checkpoint:
         raise ValueError(
             "Source checkpoint is missing training velocity statistics; retrain Phase 1 "
             "before alignment so target labels cannot determine the decoder scale."
         )
+    src_train_loader, _, _, n_src_neurons, _ = get_nhp_dataloaders(
+        file_path=args.source_data_path,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        augment_multiplier=1,  # Clean source bank
+        split_seed=checkpoint["split_seed"],
+        split_indices=checkpoint["split_indices"],
+    )
     checkpoint_velocity_stats = {
         "velocity_mean": checkpoint["velocity_mean"],
         "velocity_std": checkpoint["velocity_std"],
     }
-    tgt_train_loader, _, _, n_tgt_neurons, _ = get_nhp_dataloaders(
+    tgt_train_loader, _, _, n_tgt_neurons, target_data_metadata = get_nhp_dataloaders(
         file_path=args.target_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         augment_multiplier=args.augment_mult,
-        seed=args.seed,
+        split_seed=args.split_seed,
         velocity_stats=checkpoint_velocity_stats,
         include_validation=False,
         include_test=False,
@@ -282,6 +286,8 @@ def main():
             "velocity_mean": checkpoint_velocity_stats["velocity_mean"],
             "velocity_std": checkpoint_velocity_stats["velocity_std"],
             "alignment_epochs": args.epochs,
+            "split_indices": target_data_metadata["split_indices"],
+            "split_seed": target_data_metadata["split_seed"],
         },
         save_path,
     )

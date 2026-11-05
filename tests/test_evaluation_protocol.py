@@ -4,8 +4,8 @@ from dataloader import denormalize_velocity, fixed_window_bounds, split_trial_in
 
 
 def test_trial_split_is_deterministic_and_disjoint():
-    first = split_trial_indices(num_trials=100, val_ratio=0.15, test_ratio=0.15, seed=23)
-    second = split_trial_indices(num_trials=100, val_ratio=0.15, test_ratio=0.15, seed=23)
+    first = split_trial_indices(num_trials=100, val_ratio=0.15, test_ratio=0.15, split_seed=23)
+    second = split_trial_indices(num_trials=100, val_ratio=0.15, test_ratio=0.15, split_seed=23)
 
     assert all(torch.equal(left, right) for left, right in zip(first, second))
     train, validation, test = first
@@ -23,7 +23,7 @@ def test_overlapping_trial_windows_stay_in_the_same_partition():
         num_trials=6,
         val_ratio=0.15,
         test_ratio=0.15,
-        seed=17,
+        split_seed=17,
         window_intervals=intervals,
     )
     partition = {index: split_id for split_id, split in enumerate(splits) for index in split.tolist()}
