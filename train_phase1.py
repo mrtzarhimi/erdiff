@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from dataloader import NHPDataset, get_nhp_dataloaders
+from dataloader import NHPDataset, denormalize_velocity, get_nhp_dataloaders
 from vae import SequentialVAE, poisson_nll_loss, kl_divergence_loss, trajectory_smoothness_loss
 from diffusion import LatentDiffusionModel, VPSDEScheduler, dsm_loss
 from decoder_models import compute_r2_score, compute_rmse
@@ -134,6 +134,7 @@ def main():
     parser.add_argument("--augment_mult", type=int, default=5, help="Data augmentation replication factor")
     parser.add_argument("--kl_weight", type=float, default=0.05, help="ELBO KL loss weight")
     parser.add_argument("--behavior_weight", type=float, default=2.0, help="Velocity MSE loss weight")
+    parser.add_argument("--inspect_data_only", action="store_true", help="Report source trial and velocity-window diagnostics without training")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -180,6 +181,25 @@ def main():
         f"{torch.bincount(train_data.targets, minlength=8).tolist()} / "
         f"{torch.bincount(val_loader.dataset.targets, minlength=8).tolist()}"
     )
+    if torch.count_nonzero(train_data.targets) == 0 and torch.count_nonzero(val_loader.dataset.targets) == 0:
+        print("All encoded directions are zero; this also occurs when target_dir is absent in the source file.")
+
+    for split_name, split_data in (("train", train_data), ("val", val_loader.dataset)):
+        physical_velocity = denormalize_velocity(split_data.velocities, velocity_stats)
+        speeds = torch.linalg.vector_norm(physical_velocity, dim=-1)
+        peak_bins = speeds.argmax(dim=1)
+        edge_bins = min(5, args.seq_len // 2)
+        edge_fraction = ((peak_bins < edge_bins) | (peak_bins >= args.seq_len - edge_bins)).float().mean()
+        speed_profile = speeds.mean(dim=0)
+        print(
+            f"{split_name} velocity peaks: median bin={peak_bins.median().item()}, "
+            f"edge fraction={edge_fraction.item():.2f}; mean speed by bin="
+            f"{[round(value, 3) for value in speed_profile.tolist()]}"
+        )
+
+    if args.inspect_data_only:
+        print("Source data inspection complete; no model was trained.")
+        return
 
     # 2. Instantiate Models
     vae = SequentialVAE(
