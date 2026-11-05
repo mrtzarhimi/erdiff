@@ -345,6 +345,14 @@ fields may be run only as labelled known-configuration replays; they are not
 promoted to exact reproductions. The output records per-session update counts,
 sample exposures, channel widths, and evaluation metrics.
 
+To create this parent manifest, first run the R150 cross-day reference into a
+fresh checkpoint directory, then use
+\path{build_cross_day_reference.py} to aggregate those session checkpoints.
+Phase 1 alone cannot supply the held-out target partitions needed for a
+controlled cross-day replay. The exporter rejects mixed settings, source
+checkpoints, data fingerprints, or code revisions rather than inferring a
+reference from incomplete artifacts.
+
 The reference, variance control, noise, width, and gradient settings are
 written to each resolved manifest before training begins. Case output folders
 are unique and existing folders are rejected, so prior results are not

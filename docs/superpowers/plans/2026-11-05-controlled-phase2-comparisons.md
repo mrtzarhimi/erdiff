@@ -107,23 +107,23 @@
 
 ### Task 6: Expose individual and combined controlled runs
 
-**Files:** create `controlled_phase2_runs.py`, `tests/test_controlled_phase2_runs.py`; modify `cross_day.py`, `source_synthetic_checks.py`, and `noted.tex`.
+**Files:** create `controlled_phase2_runs.py`, `tests/test_controlled_phase2_runs.py`, and `build_cross_day_reference.py`; modify `cross_day.py`, `source_synthetic_checks.py`, and `noted.tex`.
 
 **Interfaces:** CLI `--reference_run PATH --protocol source_self|synthetic|cross_day --case reference|control|fixed_noise|matched_size|gradient_balance|all --output_root PATH`. Base seeds default 42 and must agree with the reference. Cases resolve to explicit flags and a saved resolved manifest before any future training starts.
 
-- [x] Write checks that all cases share baseline hyperparameters and a 150-epoch per-session budget, change only declared factors, use unique output directories, restore saved target splits, reject raw-window overlap and verify forwarding of frozen/noise/mapping/gradient controls. Tests remain unrun.
+- [x] Write checks that all cases share baseline hyperparameters and a 150-epoch per-session budget, change only declared factors, use unique output directories, restore saved target splits, reject raw-window overlap and verify forwarding of frozen/noise/mapping/gradient controls. Add an exporter aggregation check. Tests remain unrun.
 - [x] Define cases exactly as in the spec: reference R150; controlled C0 with full variance weight 10/floor 0.9; F/S/G individual factors; ALL combines them. Record source self-copy identity and that equal-width source self-check does not demonstrate unequal-width performance.
 - [x] Keep actual channel removal in the source-only development matrix. Preserve disjoint adaptation/evaluation source-validation intervals and source-test reservation. Candidates use the same cohort and epoch count; update counts and sample exposures are recorded.
 - [x] Forward controls through orchestration and manifests. Existing output roots are rejected, and a specified missing Phase 1 checkpoint fails rather than retraining.
 - [x] Update `noted.tex` with independent Gaussian streams, budget matching, width mapping limitations, gradient calibration math, freeze assertions and the ablation matrix. XeLaTeX was not run.
-- [ ] When authorized: `pytest tests/test_controlled_phase2_runs.py -q`; expected tests pass. No source/target pipeline execution is currently permitted.
+- [ ] When authorized: `pytest tests/test_controlled_phase2_runs.py tests/test_build_cross_day_reference.py -q`; no source/target pipeline execution is currently permitted.
 - [x] Commit: `feat: orchestrate budget-matched Phase 2 ablations`.
 
-**Execution note:** the CLI, source-only protocols, cross-day split/fingerprint gate, tests, plan and research note are implemented. Runtime tests, Phase 1/2, cross-day evaluation and XeLaTeX were not run under the no-execution instruction. Cross-day use remains contingent on preparing a manifest with saved per-session splits, fingerprints and preprocessing.
+**Execution note:** the CLI, source-only protocols, cross-day split/fingerprint gate, reference-manifest exporter, tests, plan and research note are implemented. Runtime tests, Phase 1/2, cross-day evaluation and XeLaTeX were not run under the no-execution instruction. Cross-day use starts with an R150 baseline run, followed by the exporter command in the preceding section.
 
 ## Implemented checking commands (execution remains disabled)
 
-After implementation/review and a reference manifest with required provenance have been prepared, the user can request execution. The JSON must include an R150 resolved configuration, source checkpoint/data paths, saved source splits, and (for cross-day) a `target_sessions` map keyed by exact session filename. Each target entry must include `target_split_indices` with indexed raw-window `window_intervals`, `data_fingerprint.sha256`, and session preprocessing provenance. The cross-day launcher hashes each session file and rejects missing or mismatched artifacts.
+For cross-day use, first run the R150 reference with `cross_day.py` into a fresh checkpoint directory. Then run `build_cross_day_reference.py` over those per-session checkpoints to create `reference_r150.json`; the exporter checks source/target hashes, common settings, code revision, and saved splits. The JSON includes source checkpoint/data paths and a `target_sessions` map keyed by exact session filename. Each target entry carries `target_split_indices` with raw-window `window_intervals`, `data_fingerprint.sha256`, and preprocessing provenance. The controlled launcher hashes each session again and rejects missing or mismatched artifacts.
 
 ```bash
 # Independent source self-checks, all using the same reference budget.
