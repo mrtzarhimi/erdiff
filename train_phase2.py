@@ -224,7 +224,20 @@ def main():
                         help="Entropy weight for full-trajectory transport; default preserves the former per-element temperature")
     parser.add_argument("--sinkhorn_iters", type=int, default=100, help="Log-domain transport scaling iterations")
     parser.add_argument("--smooth_weight", type=float, default=0.0, help="Optional trajectory-smoothness variant; paper default is zero")
+    parser.add_argument("--mla_diagnostics", action="store_true", help="Source-only variance and fixed-noise gradient probes")
+    parser.add_argument("--mla_diagnostics_only", action="store_true", help="Record initial probes and exit without optimizer updates")
+    parser.add_argument("--mla_probe_times", type=float, nargs="+", default=[0.01, 0.05, 0.2, 0.5, 0.9])
+    parser.add_argument("--mla_probe_trials", type=int, default=16)
+    parser.add_argument("--mla_probe_seed", type=int, default=42)
+    parser.add_argument("--mla_diagnostic_every", type=int, default=10)
     args = parser.parse_args()
+
+    if args.mla_diagnostics_only:
+        args.mla_diagnostics = True
+    if args.mla_diagnostics and not args.source_self_check:
+        raise ValueError("MLA diagnostics currently require --source_self_check; only source training trials are probed.")
+    if args.mla_probe_trials < 1 or args.mla_diagnostic_every < 1:
+        raise ValueError("Diagnostic trial count and interval must be positive.")
 
     if args.source_self_check and os.path.realpath(args.source_data_path) != os.path.realpath(args.target_data_path):
         raise ValueError("--source_self_check requires identical source and target data paths.")
@@ -353,6 +366,22 @@ def main():
         print(f"Source self-check validation baseline: R2={source_r2:.2f}% | normalized RMSE={source_rmse:.4f}")
 
     save_path = os.path.join(args.save_dir, "phase2_aligned_target_model.pt")
+    diagnostics = None
+    if args.mla_diagnostics:
+        import math
+        from mla_diagnostics import MLADiagnostics
+        if not args.mla_probe_times or any(
+            not math.isfinite(t) or not scheduler.t_min <= t <= scheduler.T for t in args.mla_probe_times
+        ):
+            raise ValueError("Probe times must lie within the source diffusion training interval.")
+        diagnostics = MLADiagnostics(
+            clean_target_loader.dataset, checkpoint["split_indices"]["train"], latent_dim,
+            args.mla_probe_times, args.mla_probe_seed, args.mla_probe_trials, args.save_dir,
+        )
+        diagnostics.record(0, vae, diffusion_model, scheduler, device, args.batch_size)
+        if args.mla_diagnostics_only:
+            print("MLA diagnostics complete; no optimizer updates or aligned checkpoint were produced.")
+            return
 
     print("\nStarting Maximum Likelihood Alignment (Phase 2)...")
     for epoch in range(1, args.epochs + 1):
@@ -383,6 +412,11 @@ def main():
                 source_r2, source_rmse = evaluate_phase1(vae, src_validation_loader, device)
                 source_self_history.append({"epoch": epoch, "r2": source_r2, "normalized_rmse": source_rmse})
                 print(f"Source self-check validation: R2={source_r2:.2f}% | normalized RMSE={source_rmse:.4f}")
+
+        if diagnostics is not None and (
+            epoch in (1, 5) or epoch % args.mla_diagnostic_every == 0 or epoch == args.epochs
+        ):
+            diagnostics.record(epoch, vae, diffusion_model, scheduler, device, args.batch_size)
 
     torch.save(
         {

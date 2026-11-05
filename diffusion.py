@@ -251,6 +251,11 @@ def mla_loss(
     t = scheduler.sample_timesteps(batch_size, z_0_target.device)
     eps = torch.randn_like(z_0_target)
 
+    return fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps)
+
+
+def fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps):
+    """The production MLA objective with explicit timesteps and Gaussian noise."""
     # Differentiable forward diffusion of target latents
     z_t, _ = scheduler.add_noise(z_0_target, t, eps)
 
