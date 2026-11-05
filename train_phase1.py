@@ -175,6 +175,11 @@ def main():
         f"Source trials: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)} | "
         f"validation source-mean R²={baseline_r2:.2f}%"
     )
+    print(
+        "Source direction counts (train/val, classes 0–7): "
+        f"{torch.bincount(train_data.targets, minlength=8).tolist()} / "
+        f"{torch.bincount(val_loader.dataset.targets, minlength=8).tolist()}"
+    )
 
     # 2. Instantiate Models
     vae = SequentialVAE(
@@ -201,6 +206,7 @@ def main():
 
     # 4. Cooperative Training Loop
     best_val_r2 = -float("inf")
+    best_epoch = None
     save_path = os.path.join(args.save_dir, "phase1_source_models.pt")
 
     print("\nStarting Cooperative Source Domain Training (Phase 1)...")
@@ -230,6 +236,7 @@ def main():
 
         if val_r2 > best_val_r2:
             best_val_r2 = val_r2
+            best_epoch = epoch
             torch.save(
                 {
                     "epoch": epoch,
@@ -247,7 +254,10 @@ def main():
                 save_path,
             )
 
-    print(f"\nPhase 1 Complete. Best Source Val R^2: {best_val_r2:.2f}%. Saved to {save_path}.")
+    print(
+        f"\nPhase 1 Complete. Best Source Val R^2: {best_val_r2:.2f}% "
+        f"at epoch {best_epoch}. Saved to {save_path}."
+    )
 
 
 if __name__ == "__main__":

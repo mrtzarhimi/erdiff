@@ -118,3 +118,19 @@ These edits address evaluation leakage and scale bias, but they do not establish
 4. **Performance attribution:** do not tune on real target labels. First obtain paired artifacts and run the authorized source-only and numerical checks. Then isolate preprocessing, source checkpoint, target augmentation, initialization, objective, and optimizer budget one factor at a time.
 
 No implementation repair in this regression investigation is claimed as complete. Numerical, data-dependent, or training conclusions remain pending the execution authorization specified in the plan. The earlier target-label leakage safeguards and split persistence remain in place, but do not by themselves establish paper fidelity or explain alignment harm.
+
+## Supplied Phase 1 run and source generalization gap (2026-11-05)
+
+The user supplied a Phase 1 console log for `/content/Chewie_CO_2016/Chewie_20160927_001.mat`, 96 neurons, 39 bins, 200 epochs, CUDA. This is distinct from `cross_day.py`'s default source filename `Chewie_20160928_001.mat`; comparisons must identify the actual source session and split. No matching checkpoint, split-index file, dataset, or full run command was available here, and this run was not reproduced locally.
+
+| Observed epoch | Reported train R² | Validation R² | Validation RMSE | DSM loss |
+|---|---:|---:|---:|---:|
+| 10 | 50.72% | −36.23% | 1.1429 | 0.1061 |
+| 100 | 89.10% | −55.60% | 1.1973 | 0.0388 |
+| 200 | 90.87% | −79.38% | 1.2261 | 0.0356 |
+
+The run reports **best** source validation R² of −8.76%; the epoch of that checkpoint was not printed. All shown validation scores are negative. Validation RMSE is in source-normalized velocity units in `train_phase1.py`, not physical units. Falling DSM loss does not establish good velocity decoding.
+
+The original train and validation R² columns were computed differently: `train_epoch_phase1` averaged per-batch R² on noisy inputs using sampled latents during training, whereas `evaluate_phase1` computed one R² over clean validation trials using posterior means. This is a confirmed reporting inconsistency, not an explanation for the negative validation score. Commit `286c61e` replaces the reported train value with an evaluation-mode, unaugmented, full-partition score and prints train/validation/test counts plus a source-mean validation baseline. It does not alter training, checkpoint selection, or evaluation partitions. This change was statically reviewed only under the user's no-execution instruction.
+
+**Next Phase 1 gate:** inspect the new clean-train R², validation R², source-mean baseline, split counts, selected checkpoint epoch, and per-direction trial counts from one authorized run on the same session and fixed split. If clean-train is high while validation remains negative, inspect cue-relative velocity windows, trial timing, neuron order, train/validation distribution, and model capacity before changing learning rates. If clean-train is also low, inspect the objective and decoder fit. Neither pattern has yet been measured here. Target-session results must not influence this Phase 1 diagnosis or hyperparameter choice.
