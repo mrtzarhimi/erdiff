@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from dataloader import NHPDataset, get_nhp_dataloaders
 from vae import SequentialVAE, trajectory_smoothness_loss, sample_latent_posterior
+from train_phase1 import evaluate_phase1
 from diffusion import (
     LatentDiffusionModel,
     VPSDEScheduler,
@@ -204,6 +205,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random state seed")
     parser.add_argument("--split_seed", type=int, default=42, help="Seed used only to define trial partitions")
     parser.add_argument("--source_checkpoint", type=str, required=True, help="Path to saved Phase 1 checkpoint (.pt)")
+    parser.add_argument("--source_self_check", action="store_true",
+                        help="Diagnostic: align source training data to itself and report source validation R2 without checkpoint selection")
     parser.add_argument("--source_data_path", type=str, required=True, help="Path to source session .mat file")
     parser.add_argument("--target_data_path", type=str, required=True, help="Path to target session .mat file")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Output directory")
@@ -222,6 +225,9 @@ def main():
     parser.add_argument("--sinkhorn_iters", type=int, default=100, help="Log-domain transport scaling iterations")
     parser.add_argument("--smooth_weight", type=float, default=0.0, help="Optional trajectory-smoothness variant; paper default is zero")
     args = parser.parse_args()
+
+    if args.source_self_check and os.path.realpath(args.source_data_path) != os.path.realpath(args.target_data_path):
+        raise ValueError("--source_self_check requires identical source and target data paths.")
 
     set_seed(args.seed)
 
@@ -244,13 +250,15 @@ def main():
             "Source checkpoint is missing training velocity statistics; retrain Phase 1 "
             "before alignment so target labels cannot determine the decoder scale."
         )
-    src_train_loader, _, _, n_src_neurons, _ = get_nhp_dataloaders(
+    src_train_loader, src_validation_loader, _, n_src_neurons, _ = get_nhp_dataloaders(
         file_path=args.source_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         augment_multiplier=1,
         split_seed=checkpoint["split_seed"],
         split_indices=checkpoint["split_indices"],
+        include_validation=args.source_self_check,
+        include_test=False,
     )
     checkpoint_velocity_stats = {
         "velocity_mean": checkpoint["velocity_mean"],
@@ -263,6 +271,7 @@ def main():
         augment_multiplier=args.augment_mult,
         split_seed=args.split_seed,
         velocity_stats=checkpoint_velocity_stats,
+        split_indices=checkpoint["split_indices"] if args.source_self_check else None,
         include_validation=False,
         include_test=False,
         include_behavior=False,
@@ -328,6 +337,11 @@ def main():
 
     # Save the initialization for a paired, pre-alignment target baseline.
     unaligned_read_in_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
+    source_self_history = []
+    if args.source_self_check:
+        source_r2, source_rmse = evaluate_phase1(vae, src_validation_loader, device)
+        source_self_history.append({"epoch": 0, "r2": source_r2, "normalized_rmse": source_rmse})
+        print(f"Source self-check validation baseline: R2={source_r2:.2f}% | normalized RMSE={source_rmse:.4f}")
 
     save_path = os.path.join(args.save_dir, "phase2_aligned_target_model.pt")
 
@@ -356,6 +370,10 @@ def main():
                 f"Read-in grad: {align_metrics['grad_norm']:.4f} | "
                 f"Clipped: {align_metrics['clipped_steps']}/{align_metrics['updates']}"
             )
+            if args.source_self_check:
+                source_r2, source_rmse = evaluate_phase1(vae, src_validation_loader, device)
+                source_self_history.append({"epoch": epoch, "r2": source_r2, "normalized_rmse": source_rmse})
+                print(f"Source self-check validation: R2={source_r2:.2f}% | normalized RMSE={source_rmse:.4f}")
 
     torch.save(
         {
@@ -365,6 +383,8 @@ def main():
             "velocity_mean": checkpoint_velocity_stats["velocity_mean"],
             "velocity_std": checkpoint_velocity_stats["velocity_std"],
             "alignment_epochs": args.epochs,
+            "source_self_check": args.source_self_check,
+            "source_self_history": source_self_history,
             "diffusion_training": noise_config,
             "alignment_updates": args.epochs * len(tgt_train_loader if args.augment_target else clean_target_loader),
             "split_indices": target_data_metadata["split_indices"],
