@@ -286,6 +286,48 @@ batch, and detection of identical trials with a varying temporal template.
 They were not executed. No new training result, numerical validation of the
 constraint, typeset PDF, or performance improvement is claimed in this note.
 
+\section{Source-only synthetic development checks}
+
+\path{source_synthetic_checks.py} now provides a separate development harness.
+It reads one source checkpoint and its saved source training/validation split.
+The source training trials provide the frozen posterior bank and variance
+reference. Saved validation windows are partitioned into adaptation and
+evaluation groups with a local split seed, preserving connected groups of
+overlapping raw intervals. Adaptation receives transformed spikes only;
+evaluation uses the same transformation on the disjoint evaluation group and
+reports final, fixed-duration decoding scores. Source test trials and real
+target sessions are not evaluated or used for model selection.
+
+Each transformation is fixed by \texttt{--shift\_seed} and shared across
+weights 1 and 10. Identity is an additional no-shift control. With observations
+written as column vectors, permutation and gain shifts take the forms
+$x'=Px$ and $x'=Dx$, respectively. They admit exact first-layer inverses
+$W'=WP^\top$ and $W'=WD^{-1}$, with unchanged bias and frozen remaining
+layers. Gain factors are independently fixed in $[0.5,1.5)$.
+The harness checks these oracle read-ins against clean source predictions;
+\emph{oracle weights are never used to initialize adaptation}. Actual
+adaptation starts from the ordinary source read-in for every condition.
+
+The removal condition zero-masks a fixed approximately 20\% of channels and
+retains the input width. It is lossy and has no claimed exact inverse. This
+is a controlled information-loss check, not a reproduction of a session with
+a physically different channel count. Every run resets the model, optimizer,
+sampler and noise seed, uses a fixed final epoch, and records update counts.
+The full-training penalty pool consists solely of synthetic adaptation
+trials; the source reference remains the original source training bank.
+
+The harness saves transformation tensors, development indices, raw window
+intervals, checkpoint/data SHA256 fingerprints, per-run histories and read-ins,
+and a summary CSV with paired decoding and variance statistics. RMSE is
+reported after inversion of the saved source transform, in raw velocity
+units. The clean-source score is measured on the same development evaluation
+cohort; it need not equal the source checkpoint's score on all validation
+trials. These validation trials already contributed to source checkpoint
+selection, so this is development evidence, not untouched final confirmation.
+Settings must be frozen before later source-test or real-target confirmation.
+Neither the synthetic checks nor the full-pool implementation tests have
+been executed during this implementation; no new result is asserted.
+
 \begin{thebibliography}{9}\small
 \bibitem{erdiff}
 Y. Wang, Z. Wu, C. Li, and A. Wu.
