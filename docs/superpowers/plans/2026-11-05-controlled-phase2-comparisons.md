@@ -83,13 +83,13 @@
 
 **Interfaces:** `NeuronInputMap` records raw width, model width, kept indices and padding; `apply(spikes) -> Tensor` transforms inputs; `map_readin(initial_readin) -> nn.Linear` preserves the initialized linear function for the zero-padding case. Serialize/restore mappings with target checkpoints.
 
-- [ ] Write tests for native 96-to-95 adaptation, identity width, deterministic wider-target selection, narrow zero-padding, and exact padded zero-step predictions using projected common weights and unchanged bias.
-- [ ] Add `--match_input_size` (off), `--input_mapping_seed` (42), and explicit `--readin_init random`. Resolve native initialization from raw width before mapping; retain existing named policies for reference runs. Do not let processed equal width silently trigger source-copy initialization.
-- [ ] Apply the saved mapping after normalization and before the read-in in both adaptation and evaluation; padding must remain zero in model-input units. Construct model input width from the checkpoint rather than raw data width. Reject missing/incompatible mappings for matched checkpoints. Report both channel counts.
-- [ ] Add a genuinely reduced-width `channel_removal` synthetic shift, distinct from existing zero-mask removal. Keep the same removed indices across candidates. The retained channel mapping is known for synthetic controls, not inferred from real target labels.
-- [ ] Record wider-target selection as information loss, not a functionally equivalent padding experiment.
-- [ ] When authorized: `pytest tests/test_neuron_input_mapping.py tests/test_synthetic_shifts.py -q`; expected tests pass. Otherwise mark unrun.
-- [ ] Commit: `feat: add optional source-width input mapping with explicit initialization`.
+- [x] Write tests for native 96-to-95 adaptation, identity width, deterministic wider-target selection, narrow zero-padding, and padded zero-step predictions using projected common weights and unchanged bias. Tests are present but unrun.
+- [x] Add `--match_input_size` (off), `--input_mapping_seed` (42), and explicit `--readin_init random`. Resolve native initialization from raw width before mapping; retain existing named policies for reference runs. Do not let processed equal width silently trigger source-copy initialization.
+- [x] Apply the saved mapping after normalization and before the read-in in both adaptation and evaluation; padding must remain zero in model-input units. Construct model input width from the checkpoint rather than raw data width. Reject missing/incompatible mappings for matched checkpoints. Report both channel counts.
+- [x] Add a genuinely reduced-width `channel_removal` synthetic shift, distinct from existing zero-mask removal. Keep the same removed indices across candidates. The retained channel mapping is known for synthetic controls, not inferred from real target labels.
+- [x] Record wider-target selection as information loss, not a functionally equivalent padding experiment.
+- [ ] When authorized: execute the focused tests above. Not run under the standing no-execution instruction.
+- [x] Commit: `feat: add optional source-width input mapping with explicit initialization`.
 
 ### Task 5: Measure conflicts and add source-calibrated gradient scaling
 

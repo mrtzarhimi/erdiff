@@ -119,7 +119,11 @@ def main():
     parser.add_argument("--phase2_mla_variance_weight", type=float, default=0.0, help="Optional MLA source-variance constraint")
     parser.add_argument("--phase2_mla_variance_floor", type=float, default=0.9, help="Source standard-deviation floor ratio")
     parser.add_argument("--phase2_mla_variance_scope", choices=("batch", "full_train"), default="batch")
-    parser.add_argument("--phase2_readin_init", choices=("source_or_random", "ridge"), default="source_or_random")
+    parser.add_argument("--phase2_readin_init", choices=("source_or_random", "ridge", "random"), default="source_or_random")
+    parser.add_argument("--phase2_match_input_size", action="store_true",
+                        help="Map each target session to the source checkpoint input width")
+    parser.add_argument("--input_mapping_seed", type=int, default=42,
+                        help="Seed for deterministic wider-target channel selection")
     parser.add_argument("--phase2_augment_target", action="store_true", help="Experimental target-spike augmentation")
     parser.add_argument("--force_phase1", action="store_true", help="Force re-training Phase 1 even if ckpt exists")
     args = parser.parse_args()
@@ -209,6 +213,8 @@ def main():
             cmd_p2.extend(("--ot_epsilon", str(args.phase2_ot_epsilon)))
         if args.phase2_augment_target:
             cmd_p2.append("--augment_target")
+        if args.phase2_match_input_size:
+            cmd_p2.extend(("--match_input_size", "--input_mapping_seed", str(args.input_mapping_seed)))
         subprocess.run(cmd_p2, check=True)
 
         # Rename saved Phase 2 checkpoint to session-specific filename

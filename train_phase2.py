@@ -110,8 +110,11 @@ def initialize_target_read_in(
       The previous ridge warm start remains an optional experimental variant.
     """
     new_read_in = nn.Linear(n_tgt_neurons, hidden_dim).to(device)
-    if init_mode not in ("source_or_random", "ridge"):
+    if init_mode not in ("source_or_random", "ridge", "random"):
         raise ValueError(f"Unknown target read-in initialization: {init_mode}")
+
+    if init_mode == "random":
+        return new_read_in
 
     if n_tgt_neurons == n_src_neurons:
         new_read_in.bias.copy_(source_read_in.bias)
@@ -345,8 +348,12 @@ def main():
     parser.add_argument("--log_component_gradients", action="store_true")
     parser.add_argument("--augment_mult", type=int, default=3, help="Target data repetition when --augment_target is enabled")
     parser.add_argument("--augment_target", action="store_true", help="Experimental variant: augment target adaptation spikes")
-    parser.add_argument("--readin_init", choices=("source_or_random", "ridge"), default="source_or_random",
-                        help="Initialize equal-width read-ins from source; use random or ridge for changed neuron counts")
+    parser.add_argument("--readin_init", choices=("source_or_random", "ridge", "random"), default="source_or_random",
+                        help="Initialize from source when raw widths match, fit ridge, or use random weights")
+    parser.add_argument("--match_input_size", action="store_true",
+                        help="Map target channels to source checkpoint input width before the read-in")
+    parser.add_argument("--input_mapping_seed", type=int, default=42,
+                        help="Seed for deterministic channel selection when target width exceeds source width")
     parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off weighting Sinkhorn loss")
     parser.add_argument("--ot_epsilon", type=float, default=None,
                         help="Entropy weight for full-trajectory transport; default preserves the former per-element temperature")
@@ -464,7 +471,15 @@ def main():
         include_test=False,
         include_behavior=False,
     )
-    print(f"Source neurons: {n_src_neurons} | Target neurons: {n_tgt_neurons}")
+    input_mapping = (
+        NeuronInputMap.create(n_tgt_neurons, n_src_neurons, args.input_mapping_seed)
+        if args.match_input_size else None
+    )
+    model_input_width = input_mapping.model_width if input_mapping is not None else n_tgt_neurons
+    print(
+        f"Source neurons: {n_src_neurons} | Target raw channels: {n_tgt_neurons} | "
+        f"Model input channels: {model_input_width}"
+    )
     clean_source_loader = clean_training_view(src_train_loader, args.batch_size)
     clean_target_loader = clean_training_view(tgt_train_loader, args.batch_size)
     from phase2_sampling import make_alignment_loader
@@ -493,6 +508,9 @@ def main():
         "hidden_dim": hidden_dim,
         "source_neurons": n_src_neurons,
         "target_neurons": n_tgt_neurons,
+        "model_input_width": model_input_width,
+        "match_input_size": args.match_input_size,
+        "input_mapping_seed": args.input_mapping_seed,
         "batch_size": args.batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
@@ -599,6 +617,34 @@ def main():
     source_rng = source_sampling_generator(args.seed)
     source_variance = None
     variance_pool_spikes = None
+
+    # 4. Initialize Target Read-In (handles both equal and mismatched neuron counts)
+    raw_width_read_in = initialize_target_read_in(
+        source_read_in=vae.encoder.read_in,
+        src_loader=clean_source_loader,
+        tgt_loader=clean_target_loader,
+        n_src_neurons=n_src_neurons,
+        n_tgt_neurons=n_tgt_neurons,
+        hidden_dim=hidden_dim,
+        device=device,
+        init_mode=args.readin_init,
+    )
+    warm_read_in = (
+        input_mapping.map_readin(raw_width_read_in).to(device)
+        if input_mapping is not None else raw_width_read_in
+    )
+    vae.encoder.read_in = warm_read_in
+    if input_mapping is not None:
+        mapped_datasets = {id(tgt_train_loader.dataset): tgt_train_loader.dataset,
+                           id(clean_target_loader.dataset): clean_target_loader.dataset}
+        for dataset in mapped_datasets.values():
+            dataset.spikes = input_mapping.apply(dataset.spikes)
+        print(
+            f"Applied target input mapping after spike preprocessing: "
+            f"{n_tgt_neurons} raw -> {model_input_width} model channels; "
+            f"padding={input_mapping.padding}, selected={input_mapping.kept_indices.numel()}"
+        )
+
     if args.mla_variance_weight > 0 and args.alpha < 1.0:
         from mla_stabilization import source_trial_variance
         source_variance = source_trial_variance(source_latents_bank.mu)
@@ -610,19 +656,6 @@ def main():
         if args.mla_variance_scope == "full_train":
             variance_pool_spikes = clean_target_loader.dataset.spikes.to(device)
         print(f"Variance penalty scope: {args.mla_variance_scope} | trials per estimate >= {variance_trials}")
-
-    # 4. Initialize Target Read-In (handles both equal and mismatched neuron counts)
-    warm_read_in = initialize_target_read_in(
-        source_read_in=vae.encoder.read_in,
-        src_loader=clean_source_loader,
-        tgt_loader=clean_target_loader,
-        n_src_neurons=n_src_neurons,
-        n_tgt_neurons=n_tgt_neurons,
-        hidden_dim=hidden_dim,
-        device=device,
-        init_mode=args.readin_init,
-    )
-    vae.encoder.read_in = warm_read_in
     vae.freeze_for_alignment()
 
     alignment_optimizer = optim.Adam(
@@ -817,6 +850,22 @@ def main():
     manifest["source_training_config"] = checkpoint.get("training_config")
     manifest["source_training_seed"] = checkpoint.get("training_seed")
     manifest["source_selected_epoch"] = checkpoint.get("epoch")
+    mapping_state = None if input_mapping is None else input_mapping.state_dict()
+    manifest["input_mapping"] = (
+        None if mapping_state is None else {
+            "raw_width": mapping_state["raw_width"],
+            "model_width": mapping_state["model_width"],
+            "kept_indices": mapping_state["kept_indices"].tolist(),
+            "padding": mapping_state["padding"],
+        }
+    )
+    manifest["input_mapping_lossy"] = bool(
+        input_mapping is not None and input_mapping.raw_width > input_mapping.model_width
+    )
+    manifest["input_mapping_note"] = (
+        "wider-target channel selection discards information"
+        if manifest["input_mapping_lossy"] else None
+    )
     manifest["alignment_noise_bank_path"] = (
         os.path.realpath(noise_bank_path) if noise_bank is not None else None
     )
@@ -831,6 +880,11 @@ def main():
             "unaligned_read_in_state": unaligned_read_in_state,
             "target_read_in_state": {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()},
             "target_n_neurons": n_tgt_neurons,
+            "model_input_width": model_input_width,
+            "match_input_size": args.match_input_size,
+            "input_mapping": mapping_state,
+            "input_mapping_seed": args.input_mapping_seed,
+            "input_mapping_lossy": manifest["input_mapping_lossy"],
             "velocity_mean": checkpoint_velocity_stats["velocity_mean"],
             "velocity_std": checkpoint_velocity_stats["velocity_std"],
             "alignment_epochs": args.epochs,
@@ -878,6 +932,9 @@ def main():
                 "augment_mult": args.augment_mult,
                 "augment_target": args.augment_target,
                 "readin_init": args.readin_init,
+                "match_input_size": args.match_input_size,
+                "input_mapping_seed": args.input_mapping_seed,
+                "model_input_width": model_input_width,
                 "seed": args.seed,
                 "batch_size": args.batch_size,
                 "batch_sampler": "seeded_balanced_shuffle",

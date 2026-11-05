@@ -8,6 +8,7 @@ import torch
 from dataloader import denormalize_velocity, get_nhp_dataloaders
 from vae import SequentialVAE
 from decoder_models import compute_r2_score, compute_rmse
+from neuron_input_mapping import apply_mapping_to_loader, mapping_from_checkpoint
 
 def set_seed(seed: int = 42):
     import os
@@ -170,12 +171,17 @@ def main():
         include_validation=False,
     )
     verify_preprocessing(target_metadata["preprocessing"], aligned_ckpt.get("preprocessing"))
+    input_mapping, model_input_width = mapping_from_checkpoint(aligned_ckpt, n_tgt_neurons)
+    apply_mapping_to_loader(target_test_loader, input_mapping)
+    readin_state = aligned_ckpt.get("target_read_in_state", {})
+    if readin_state and readin_state["weight"].shape[1] != model_input_width:
+        raise ValueError("Aligned read-in width differs from the saved input mapping contract.")
 
     latent_dim = src_ckpt["latent_dim"]
     hidden_dim = src_ckpt["hidden_dim"]
 
     vae = SequentialVAE(
-        n_neurons=n_tgt_neurons,
+        n_neurons=model_input_width,
         latent_dim=latent_dim,
         hidden_dim=hidden_dim,
         behavior_dim=2,
@@ -235,7 +241,8 @@ def main():
     print("             EXPERIMENTAL RESULTS SUMMARY              ")
     print("=" * 55)
     print(f"Target Session       : {os.path.basename(args.target_data_path)}")
-    print(f"Target Neurons       : {n_tgt_neurons}")
+    print(f"Target Raw Channels  : {n_tgt_neurons}")
+    print(f"Model Input Channels : {model_input_width}")
     print("-" * 55)
     print(f"Pre-alignment baseline: R^2 = {r2_unaligned:6.2f}% | RMSE = {rmse_unaligned:.4f}")
     print(f"ERDiff Aligned       : R^2 = {r2_aligned:6.2f}% | RMSE = {rmse_aligned:.4f}")
@@ -247,6 +254,8 @@ def main():
         f.write(f"Test trials: {len(target_test_loader.dataset)}\n")
         f.write(f"Alignment epochs: {aligned_ckpt.get('alignment_epochs', -1)}\n")
         f.write(f"Split seed: {aligned_ckpt.get('split_seed', -1)}\n")
+        f.write(f"Target raw channels: {n_tgt_neurons}\n")
+        f.write(f"Model input channels: {model_input_width}\n")
         f.write(f"Unaligned R2: {r2_unaligned:.4f}\n")
         f.write(f"Unaligned RMSE: {rmse_unaligned:.4f}\n")
         f.write(f"Aligned R2: {r2_aligned:.4f}\n")

@@ -46,6 +46,15 @@ def make_shift(kind, n_neurons, shift_seed=42, mask_fraction=0.2):
         shift["mask"] = torch.ones(n_neurons)
         shift["mask"][removed] = 0
         shift["removed_neurons"] = removed
+    elif kind == "channel_removal":
+        if n_neurons < 2 or not 0 < mask_fraction < 1:
+            raise ValueError("Channel removal needs multiple neurons and a fraction in (0, 1).")
+        count = min(n_neurons - 1, max(1, round(mask_fraction * n_neurons)))
+        removed = torch.randperm(n_neurons, generator=generator)[:count].sort().values
+        keep = torch.ones(n_neurons, dtype=torch.bool)
+        keep[removed] = False
+        shift["removed_neurons"] = removed
+        shift["kept_indices"] = torch.arange(n_neurons)[keep]
     elif kind != "identity":
         raise ValueError(f"Unknown synthetic shift: {kind}")
     return shift
@@ -63,6 +72,8 @@ def apply_shift(spikes, shift):
         return spikes * shift["gain"].to(spikes)
     if kind == "masked_removal":
         return spikes * shift["mask"].to(spikes)
+    if kind == "channel_removal":
+        return spikes.index_select(-1, shift["kept_indices"].to(spikes.device))
     raise ValueError(f"Unknown synthetic shift: {kind}")
 
 

@@ -17,6 +17,7 @@ from mla_diagnostics import MLADiagnostics, variance_summary
 from mla_stabilization import source_trial_variance
 from alignment_noise_bank import AlignmentNoiseBank
 from phase2_freeze_guard import FrozenDiffusionGuard
+from neuron_input_mapping import NeuronInputMap
 from phase2_sampling import make_alignment_loader, source_sampling_generator
 from synthetic_shifts import apply_shift, make_shift, oracle_readin_weight, validation_development_split
 from train_phase2 import clean_training_view, extract_source_latent_bank, set_seed, train_epoch_phase2
@@ -60,8 +61,9 @@ def main():
     parser.add_argument("--source_data_path", required=True)
     parser.add_argument("--output_dir", default="./source_synthetic42")
     parser.add_argument("--weights", type=float, nargs="+", default=[1.0, 10.0])
-    parser.add_argument("--shifts", nargs="+", choices=("identity", "permutation", "gain", "masked_removal"),
-                        default=["identity", "permutation", "gain", "masked_removal"])
+    parser.add_argument("--shifts", nargs="+",
+                        choices=("identity", "permutation", "gain", "masked_removal", "channel_removal"),
+                        default=["identity", "permutation", "gain", "masked_removal", "channel_removal"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--shift_seed", type=int, default=42)
@@ -77,6 +79,8 @@ def main():
     parser.add_argument("--noise_seed", type=int, default=42)
     parser.add_argument("--noise_bank_replicates", type=int, default=8)
     parser.add_argument("--noise_bank_path", default=None)
+    parser.add_argument("--match_input_size", action="store_true")
+    parser.add_argument("--input_mapping_seed", type=int, default=42)
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 2 or not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError("Use positive epochs/lr and batch size >= 2.")
@@ -168,8 +172,29 @@ def main():
 
     records = []
     for kind, shift in shifts.items():
-        adaptation_spikes = apply_shift(validation_spikes[adaptation_offsets], shift)
-        evaluation_spikes = apply_shift(validation_spikes[evaluation_offsets], shift)
+        adaptation_raw = apply_shift(validation_spikes[adaptation_offsets], shift)
+        evaluation_raw = apply_shift(validation_spikes[evaluation_offsets], shift)
+        raw_target_channels = adaptation_raw.size(-1)
+        input_mapping = (
+            NeuronInputMap.create(raw_target_channels, n_neurons, args.input_mapping_seed)
+            if args.match_input_size else None
+        )
+        model_input_channels = input_mapping.model_width if input_mapping is not None else raw_target_channels
+        adaptation_spikes = input_mapping.apply(adaptation_raw) if input_mapping is not None else adaptation_raw
+        evaluation_spikes = input_mapping.apply(evaluation_raw) if input_mapping is not None else evaluation_raw
+        if kind == "channel_removal":
+            raw_readin = torch.nn.Linear(raw_target_channels, checkpoint["hidden_dim"]).to(device)
+            with torch.no_grad():
+                raw_readin.weight.copy_(source.encoder.read_in.weight[:, shift["kept_indices"].to(device)])
+                raw_readin.bias.copy_(source.encoder.read_in.bias)
+            synthetic_init = "source read-in restricted to retained channels; lossy"
+        else:
+            raw_readin = copy.deepcopy(source.encoder.read_in)
+            synthetic_init = "source read-in"
+        initial_readin = (
+            input_mapping.map_readin(raw_readin).to(device)
+            if input_mapping is not None else raw_readin
+        )
         dataset = NHPDataset(adaptation_spikes, torch.zeros(len(adaptation_spikes), args.seq_len, 2),
                              torch.zeros(len(adaptation_spikes), dtype=torch.long), include_behavior=False,
                              trial_ids=validation_ids[adaptation_offsets])
@@ -190,6 +215,7 @@ def main():
             # Restart the same initialization, sampler and noise stream for each candidate.
             set_seed(args.seed)
             model = copy.deepcopy(source)
+            model.encoder.read_in = copy.deepcopy(initial_readin)
             loader = make_alignment_loader(dataset, args.batch_size, args.seed)
             optimizer = torch.optim.Adam(model.encoder.read_in.parameters(), lr=args.lr)
             source_rng = source_sampling_generator(args.seed)
@@ -250,8 +276,21 @@ def main():
             )
             after = metrics(predict(model, evaluation_spikes, device, args.batch_size), evaluation_velocity, checkpoint)
             variance_after = variance_summary(model, adaptation_spikes, device, args.batch_size)
+            mapping_state = None if input_mapping is None else input_mapping.state_dict()
             row = {
                 "shift": kind, "weight": weight, "scope": args.mla_variance_scope,
+                "raw_target_channels": raw_target_channels,
+                "model_input_channels": model_input_channels,
+                "input_mapping": None if mapping_state is None else {
+                    "raw_width": mapping_state["raw_width"],
+                    "model_width": mapping_state["model_width"],
+                    "kept_indices": mapping_state["kept_indices"].tolist(),
+                    "padding": mapping_state["padding"],
+                },
+                "input_mapping_lossy": bool(
+                    input_mapping is not None and raw_target_channels > model_input_channels
+                ),
+                "initialization": synthetic_init,
                 "variance_floor": args.mla_variance_floor, "lr": args.lr,
                 "seed": args.seed, "split_seed": args.split_seed, "shift_seed": args.shift_seed,
                 "adaptation_trials": len(adaptation_offsets), "evaluation_trials": len(evaluation_offsets),
@@ -272,6 +311,7 @@ def main():
             torch.save({
                 "read_in": {name: value.detach().cpu() for name, value in model.encoder.read_in.state_dict().items()},
                 "shift": shift, "metrics": row, "arguments": vars(args),
+                "input_mapping": mapping_state,
                 "adaptation_indices": validation_ids[adaptation_offsets],
                 "evaluation_indices": validation_ids[evaluation_offsets],
             }, run_dir / "synthetic_readin.pt")
