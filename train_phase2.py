@@ -130,6 +130,9 @@ def train_epoch_phase2(
     mla_t_min=None,
     mla_t_max=None,
     mla_fixed_t=None,
+    source_variance=None,
+    mla_variance_weight: float = 0.0,
+    mla_variance_floor: float = 0.9,
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
@@ -142,6 +145,8 @@ def train_epoch_phase2(
     total_mla = 0.0
     total_ot = 0.0
     total_smooth = 0.0
+    total_variance_floor = 0.0
+    total_variance_contribution = 0.0
     total_grad_norm = 0.0
     clipped_steps = 0
     source_mu, source_logvar = source_latents_bank
@@ -176,6 +181,17 @@ def train_epoch_phase2(
             mla_fixed_t=mla_fixed_t,
         )
         loss = loss_align
+        variance_value = 0.0
+        variance_contribution = 0.0
+        if mla_variance_weight > 0 and alpha < 1.0:
+            from mla_stabilization import source_variance_floor_loss
+            if source_variance is None:
+                raise ValueError("Variance stabilization requires a frozen source reference.")
+            loss_variance = source_variance_floor_loss(mu_t, source_variance, mla_variance_floor)
+            weighted_variance = (1.0 - alpha) * mla_variance_weight * loss_variance
+            loss = loss + weighted_variance
+            variance_value = loss_variance.item()
+            variance_contribution = weighted_variance.item()
         smooth_value = 0.0
         if smooth_weight:
             loss_smooth = trajectory_smoothness_loss(mu_t)
@@ -191,6 +207,8 @@ def train_epoch_phase2(
         total_mla += loss_mla.item()
         total_ot += loss_ot.item()
         total_smooth += smooth_value
+        total_variance_floor += variance_value
+        total_variance_contribution += variance_contribution
         total_grad_norm += grad_norm.item()
         clipped_steps += int(grad_norm.item() > 1.0)
 
@@ -200,6 +218,8 @@ def train_epoch_phase2(
         "mla": total_mla / batches,
         "ot": total_ot / batches,
         "smooth": total_smooth / batches,
+        "variance_floor": total_variance_floor / batches,
+        "variance_contribution": total_variance_contribution / batches,
         "grad_norm": total_grad_norm / batches,
         "clipped_steps": clipped_steps,
         "updates": batches,
@@ -239,7 +259,16 @@ def main():
     parser.add_argument("--mla_t_min", type=float, default=None, help="Diagnostic ablation: restrict MLA diffusion-time range")
     parser.add_argument("--mla_t_max", type=float, default=None, help="Diagnostic ablation: restrict MLA diffusion-time range")
     parser.add_argument("--mla_fixed_t", type=float, default=None, help="Diagnostic ablation: train MLA at one diffusion time")
+    parser.add_argument("--mla_variance_weight", type=float, default=0.0,
+                        help="Optional source-variance stabilization weight within the MLA branch; zero disables it")
+    parser.add_argument("--mla_variance_floor", type=float, default=0.9,
+                        help="Floor as a fraction of source trial standard deviation, in (0, 1]")
     args = parser.parse_args()
+    import math
+    if not math.isfinite(args.mla_variance_weight) or args.mla_variance_weight < 0:
+        raise ValueError("MLA variance weight must be finite and nonnegative.")
+    if not math.isfinite(args.mla_variance_floor) or not 0 < args.mla_variance_floor <= 1:
+        raise ValueError("MLA variance floor must lie in (0, 1].")
 
     if args.mla_diagnostics_only:
         args.mla_diagnostics = True
@@ -338,6 +367,12 @@ def main():
     # 3. Precompute Source Latent Bank
     print("Pre-computing source domain latent bank...")
     source_latents_bank = extract_source_latent_bank(vae, clean_source_loader, device)
+    source_variance = None
+    if args.mla_variance_weight > 0 and args.alpha < 1.0:
+        from mla_stabilization import source_trial_variance
+        source_variance = source_trial_variance(source_latents_bank[0])
+        if len(optimization_dataset) // len(alignment_loader) < 2:
+            raise ValueError("Variance stabilization needs at least two trials in every optimization batch.")
 
     # 4. Initialize Target Read-In (handles both equal and mismatched neuron counts)
     warm_read_in = initialize_target_read_in(
@@ -406,6 +441,8 @@ def main():
                 "source_epoch": checkpoint.get("epoch"), "seed": args.seed, "split_seed": args.split_seed,
                 "alpha": args.alpha, "mla_t_min": args.mla_t_min,
                 "mla_t_max": args.mla_t_max, "mla_fixed_t": args.mla_fixed_t,
+                "mla_variance_weight": args.mla_variance_weight,
+                "mla_variance_floor": args.mla_variance_floor,
             },
         )
         diagnostics.record(0, vae, diffusion_model, scheduler, device, args.batch_size)
@@ -430,6 +467,9 @@ def main():
             mla_t_min=args.mla_t_min,
             mla_t_max=args.mla_t_max,
             mla_fixed_t=args.mla_fixed_t,
+            source_variance=source_variance,
+            mla_variance_weight=args.mla_variance_weight,
+            mla_variance_floor=args.mla_variance_floor,
         )
 
         if epoch % 10 == 0 or epoch == args.epochs:
@@ -438,6 +478,8 @@ def main():
                 f"Alignment Loss: {align_metrics['total']:.4f} | "
                 f"MLA: {align_metrics['mla']:.4f} | OT: {align_metrics['ot']:.4f} | "
                 f"Smooth: {align_metrics['smooth']:.4f} | "
+                f"Var floor: {align_metrics['variance_floor']:.4f} "
+                f"(weighted {align_metrics['variance_contribution']:.4f}) | "
                 f"Read-in grad: {align_metrics['grad_norm']:.4f} | "
                 f"Clipped: {align_metrics['clipped_steps']}/{align_metrics['updates']}"
             )
@@ -459,6 +501,7 @@ def main():
             "velocity_mean": checkpoint_velocity_stats["velocity_mean"],
             "velocity_std": checkpoint_velocity_stats["velocity_std"],
             "alignment_epochs": args.epochs,
+            "source_trial_variance": None if source_variance is None else source_variance.cpu(),
             "source_self_check": args.source_self_check,
             "source_self_history": source_self_history,
             "diffusion_training": noise_config,
@@ -473,6 +516,8 @@ def main():
                 "mla_t_min": args.mla_t_min,
                 "mla_t_max": args.mla_t_max,
                 "mla_fixed_t": args.mla_fixed_t,
+                "mla_variance_weight": args.mla_variance_weight,
+                "mla_variance_floor": args.mla_variance_floor,
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
                 "augment_mult": args.augment_mult,

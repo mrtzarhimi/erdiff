@@ -116,6 +116,8 @@ def main():
     parser.add_argument("--phase2_alpha", type=float, default=0.5, help="Paper MLA/transport mixing weight")
     parser.add_argument("--phase2_ot_epsilon", type=float, default=None, help="Optional transport entropy weight")
     parser.add_argument("--phase2_smooth_weight", type=float, default=0.0, help="Optional smoothness variant")
+    parser.add_argument("--phase2_mla_variance_weight", type=float, default=0.0, help="Optional MLA source-variance constraint")
+    parser.add_argument("--phase2_mla_variance_floor", type=float, default=0.9, help="Source standard-deviation floor ratio")
     parser.add_argument("--phase2_readin_init", choices=("source_or_random", "ridge"), default="source_or_random")
     parser.add_argument("--phase2_augment_target", action="store_true", help="Experimental target-spike augmentation")
     parser.add_argument("--force_phase1", action="store_true", help="Force re-training Phase 1 even if ckpt exists")
@@ -197,6 +199,8 @@ def main():
             "--augment_mult", "3",
             "--alpha", str(args.phase2_alpha),
             "--smooth_weight", str(args.phase2_smooth_weight),
+            "--mla_variance_weight", str(args.phase2_mla_variance_weight),
+            "--mla_variance_floor", str(args.phase2_mla_variance_floor),
             "--readin_init", args.phase2_readin_init,
         ]
         if args.phase2_ot_epsilon is not None:
