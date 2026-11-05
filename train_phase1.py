@@ -3,8 +3,9 @@ import os
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader
 
-from dataloader import get_nhp_dataloaders
+from dataloader import NHPDataset, get_nhp_dataloaders
 from vae import SequentialVAE, poisson_nll_loss, kl_divergence_loss, trajectory_smoothness_loss
 from diffusion import LatentDiffusionModel, VPSDEScheduler, dsm_loss
 from decoder_models import compute_r2_score, compute_rmse
@@ -46,7 +47,6 @@ def train_epoch_phase1(
 
     total_vae_loss = 0.0
     total_dsm_loss = 0.0
-    total_r2 = 0.0
 
     for batch in loader:
         spikes = batch["spikes"].to(device)
@@ -88,12 +88,10 @@ def train_epoch_phase1(
 
         total_vae_loss += loss_vae.item()
         total_dsm_loss += loss_dm.item()
-        total_r2 += compute_r2_score(velocity, pred_vel)
 
     avg_vae = total_vae_loss / len(loader)
     avg_dm = total_dsm_loss / len(loader)
-    avg_train_r2 = total_r2 / len(loader)
-    return avg_vae, avg_dm, avg_train_r2
+    return avg_vae, avg_dm
 
 
 @torch.no_grad()
@@ -154,6 +152,30 @@ def main():
     )
     print(f"Loaded source domain with {n_neurons} neurons across trials of length {args.seq_len}.")
 
+    # Use the same clean, deterministic evaluation path for both partitions.
+    # The optimization loader repeats trials and perturbs spikes, so its batch
+    # R² cannot be compared directly with held-out validation R².
+    train_data = train_loader.dataset
+    clean_train_loader = DataLoader(
+        NHPDataset(
+            train_data.spikes, train_data.velocities, train_data.targets,
+            is_train=False,
+        ),
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+    train_idx = velocity_stats["split_indices"]["train"]
+    val_idx = velocity_stats["split_indices"]["validation"]
+    test_idx = velocity_stats["split_indices"]["test"]
+    val_velocity = val_loader.dataset.velocities
+    source_mean_baseline = train_data.velocities.mean(dim=(0, 1), keepdim=True)
+    baseline_r2 = compute_r2_score(val_velocity, source_mean_baseline.expand_as(val_velocity))
+    print(
+        f"Source trials: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)} | "
+        f"validation source-mean R²={baseline_r2:.2f}%"
+    )
+
     # 2. Instantiate Models
     vae = SequentialVAE(
         n_neurons=n_neurons,
@@ -183,7 +205,7 @@ def main():
 
     print("\nStarting Cooperative Source Domain Training (Phase 1)...")
     for epoch in range(1, args.epochs + 1):
-        vae_loss, dm_loss, train_r2 = train_epoch_phase1(
+        vae_loss, dm_loss = train_epoch_phase1(
             vae=vae,
             diffusion_model=diffusion_model,
             scheduler=scheduler,
@@ -198,9 +220,10 @@ def main():
         val_r2, val_rmse = evaluate_phase1(vae, val_loader, device)
 
         if epoch % 10 == 0 or epoch == args.epochs:
+            clean_train_r2, _ = evaluate_phase1(vae, clean_train_loader, device)
             print(
                 f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
-                f"Train R^2: {train_r2:6.2f}% | "
+                f"Train (clean) R^2: {clean_train_r2:6.2f}% | "
                 f"Val R^2: {val_r2:6.2f}% | Val RMSE: {val_rmse:.4f} | "
                 f"DSM Loss: {dm_loss:.4f}"
             )
