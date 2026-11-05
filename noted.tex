@@ -1,0 +1,290 @@
+% Engine: XeLaTeX. No external bibliography or figures are required.
+% Suggested build (not executed): xelatex -interaction=nonstopmode noted.tex
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=25mm,headheight=15pt]{geometry}
+\usepackage{fontspec}
+\IfFontExistsTF{TeX Gyre Pagella}{\setmainfont{TeX Gyre Pagella}}{\setmainfont{Latin Modern Roman}}
+\IfFontExistsTF{TeX Gyre Heros}{\setsansfont{TeX Gyre Heros}}{\setsansfont{Latin Modern Sans}}
+\setmonofont[Scale=MatchLowercase]{Latin Modern Mono}
+\usepackage{amsmath,amssymb,mathtools,bm}
+\usepackage[protrusion=true,expansion=false]{microtype}
+\usepackage[table]{xcolor}
+\usepackage{booktabs,tabularx,enumitem,fancyhdr}
+\usepackage{hyperref}
+\definecolor{ink}{HTML}{233548}
+\definecolor{accent}{HTML}{216275}
+\hypersetup{colorlinks=true,linkcolor=accent,urlcolor=accent,citecolor=accent,
+  pdftitle={Diagnosing and stabilizing MLA latent-mean collapse},
+  pdfauthor={ERDiff reproduction working notes}}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\sffamily ERDiff reproduction}
+\fancyhead[R]{\small\sffamily Source variance constraint}
+\fancyfoot[C]{\small\thepage}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45em}
+\setlist[itemize]{topsep=3pt,itemsep=2pt,leftmargin=1.4em}
+\setlist[enumerate]{topsep=3pt,itemsep=3pt,leftmargin=1.6em}
+\DeclareMathOperator{\Var}{Var}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\pos}[1]{\left[#1\right]_{+}}
+\newcommand{\stopgrad}{\operatorname{stopgrad}}
+\allowdisplaybreaks
+\begin{document}
+
+{\sffamily\small\color{accent} RESEARCH NOTE \quad 5 NOVEMBER 2026}
+\vspace{4mm}
+
+{\LARGE\bfseries\color{ink} Diagnosing and stabilizing\\[2pt] MLA latent-mean collapse}
+
+\vspace{2mm}
+{\large A configurable source variance floor for ERDiff alignment}
+
+\begin{quote}\small
+\textbf{Status.} The stabilization option is implemented in commit
+\texttt{b0a0eff}. Its tests, training experiments, and this document's XeLaTeX
+build have not been run. Observations below are from user-supplied source
+self-check logs; no improved result is claimed for the new constraint.
+\end{quote}
+
+\section{Question and measured evidence}
+
+ERDiff aligns a target encoder using a frozen source diffusion model
+\cite{erdiff}. Our source self-check starts from the trained source read-in,
+uses the same source training trials for adaptation, and reports decoding on
+the saved source validation trials. It isolates decoder degradation without
+introducing a domain shift. It does not require that the paper's objective have
+a stationary point at the source encoder.
+
+All supplied runs begin at 92.16\% validation $R^2$, use model seed 42 and split
+seed 42, and process 135 source training trials in shuffled batches of 45.
+The following measurements are at epoch 50 of MLA-only adaptation. Variance
+percentages are relative to initialization, not standard-deviation percentages.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}Xrrr@{}}
+\toprule
+Training noise & Final $R^2$ & \shortstack{Mean variance\\retained} & \shortstack{Prediction variance\\retained}\\
+\midrule
+Uniform diffusion time & $-0.12\%$ & $0.099\%$ & $0.095\%$\\
+Fixed $t=0.05$ & $74.96\%$ & $60.99\%$ & $60.75\%$\\
+Fixed $t=0.2$ & $74.52\%$ & $66.03\%$ & $65.01\%$\\
+Fixed $t=0.5$ & $0.41\%$ & $0.063\%$ & $0.062\%$\\
+\bottomrule
+\end{tabularx}
+\caption{User-supplied source-only diagnostic results. The new variance
+constraint was disabled in every row.}
+\end{table}
+
+The average encoder posterior variance remains approximately 99.98--99.99\%
+of its initial value in these runs. Thus the dominant observed failure is
+contraction of the \emph{posterior means} across observations, accompanied by
+contraction of decoder outputs. It is not a global collapse of posterior
+uncertainty. Aggregate statistics cannot rule out finer variance redistribution.
+
+Fixed-noise directional finite differences mostly agree with latent autograd
+derivatives within about 1\%, with some reported relative discrepancies around
+2\%. These checks provide no evidence of a gross latent-gradient error in the
+probed direction; they do not validate every parameter derivative. Small
+directional derivatives and float32 cancellation require inspecting absolute
+errors as well.
+
+\section{What MLA optimizes}
+
+Let $\mu_\phi(X)$ and $\ell_\phi(X)$ denote posterior mean and log variance.
+Posterior sampling and VP diffusion corruption use independent Gaussian draws:
+\begin{align}
+ Z_0 &= \mu_\phi(X)+\exp\!\left(\tfrac12\ell_\phi(X)\right)\odot\eta,
+ &\eta&\sim\mathcal N(0,I),\\
+ Z_t &= a_t Z_0+b_t\epsilon,
+ &\epsilon&\sim\mathcal N(0,I),\qquad b_t^2=1-a_t^2.
+\end{align}
+Our current MLA branch uses the trajectory-level squared residual
+\begin{equation}
+ \mathcal L_{\rm MLA}(\phi)
+ =\E_{X,t,\eta,\epsilon}
+ \left\|\epsilon-\epsilon_\theta(Z_t,t)\right\|_F^2,
+ \label{eq:mla}
+\end{equation}
+with the source denoiser $\theta$ frozen. The paper permits time weighting;
+our implementation currently uses unit weight. The beta endpoints, cutoff,
+and this weighting choice are documented reproduction choices rather than
+verified universal paper settings. For the current linear VP drift, its
+divergence term is constant with respect to the read-in parameters and does
+not change their gradient.
+
+Minimizing a likelihood-related residual over encoder outputs does not itself
+preserve distinctions between trials. An illustrative scalar Gaussian model
+makes the issue explicit. Suppose the source latent has variance $s^2$ and an
+ideal source denoiser predicts
+\begin{equation}
+ \widehat\epsilon_t(z)=k_tz,
+ \qquad k_t=\frac{b_t}{a_t^2s^2+b_t^2}.
+\end{equation}
+If the adaptive encoding is $Z_0=cX$, where $\E X=0$ and $\Var(X)=s^2$, then
+\begin{equation}
+ \E\left[\epsilon-k_t(a_tcX+b_t\epsilon)\right]^2
+ =(1-k_tb_t)^2+k_t^2a_t^2c^2s^2.
+\end{equation}
+At a nondegenerate noise level, the latter term encourages $c\to0$. Independent
+fixed posterior variance adds another constant term to this toy expectation.
+This illustrates mean contraction even with an ideal denoiser. It is not a
+proof of the exact neural-model dynamics or a claim that the full ERDiff
+objective must collapse. The paper also uses a transport regularizer.
+
+The fixed-time results indicate that noise selection affects severity, but
+both lower-noise runs still damage source decoding. Changing the noise interval
+alone is therefore not an established repair.
+
+\section{The source variance floor}
+
+For clean source training trials, compute frozen encoder means
+$M^{s}_{i\ell j}$ for trial $i$, time bin $\ell$, and latent coordinate $j$.
+The source reference is the sample variance across trials at each bin:
+\begin{equation}
+ v^{s}_{\ell j}=\stopgrad\!\left[
+ \frac{1}{N_s-1}\sum_{i=1}^{N_s}
+ (M^s_{i\ell j}-\overline M^s_{\ell j})^2\right].
+ \label{eq:sourcevariance}
+\end{equation}
+All saved source training trials contribute once, without spike augmentation
+or dropped batches. The reference is computed before adapting the read-in.
+It uses no source validation labels or target behavior labels.
+
+For an adaptation minibatch of $B\ge2$ trials, let
+\begin{equation}
+ v^{t}_{\ell j}(\phi)=\frac{1}{B-1}\sum_{i=1}^{B}
+ \left(\mu_\phi(X_i)_{\ell j}-\overline\mu_{\ell j}\right)^2.
+\end{equation}
+The proposed soft penalty is
+\begin{equation}
+ \boxed{\displaystyle
+ \mathcal V(\phi)=\sum_{\ell,j}
+ \pos{\rho\sqrt{v^{s}_{\ell j}+\delta}
+              -\sqrt{v^{t}_{\ell j}(\phi)+\delta}}^2,}
+ \qquad 0<\rho\le1,
+ \label{eq:floor}
+\end{equation}
+where $[u]_+=\max(u,0)$ and $\delta=10^{-8}$ provides numerical smoothing.
+The coefficient $\rho$ is a \emph{standard-deviation} fraction: $\rho=0.9$
+corresponds approximately to an 81\% variance floor when variances are well
+above $\delta$. It is a soft penalty, not a hard bound.
+
+Variance is taken across trials separately at every time bin. A shared,
+time-varying trajectory repeated for every trial therefore cannot satisfy
+this floor merely by retaining temporal variation. Conversely, penalizing only
+the per-sample posterior variance $\exp(\ell_\phi)$ would miss the dominant
+failure observed in the supplied logs.
+
+The total optional objective is
+\begin{equation}
+ \mathcal L=(1-\alpha)
+       \left(\mathcal L_{\rm MLA}+\lambda_v\mathcal V\right)
+       +\alpha\mathcal L_{\rm OT}
+       +\lambda_{\rm smooth}\mathcal L_{\rm smooth}.
+ \label{eq:total}
+\end{equation}
+Thus $\lambda_v=0$ recovers the existing baseline and $\alpha=1$ turns off the
+MLA branch, including its stabilization. Both MLA and $\mathcal V$ sum over
+time and latent coordinates, making their reduction conventions explicit.
+Their gradient magnitudes still depend on latent scale and require measurement.
+
+\section{Gradient and limitations}
+
+For an active deficit
+$g_{\ell j}=\rho\sqrt{v^s_{\ell j}+\delta}-\sqrt{v^t_{\ell j}+\delta}>0$,
+the derivative with respect to a minibatch posterior mean is
+\begin{equation}
+ \frac{\partial\mathcal V}{\partial\mu_{i\ell j}}
+ =-\frac{2g_{\ell j}}{(B-1)\sqrt{v^t_{\ell j}+\delta}}
+       (\mu_{i\ell j}-\overline\mu_{\ell j}).
+\end{equation}
+Negative-gradient motion pushes distinct means away from their minibatch
+mean when spread is below the reference floor. The encoder couples these
+coordinates, so an actual read-in update need not follow every independent
+latent direction. The frozen reference receives no gradient.
+
+Several limits are material:
+\begin{itemize}
+ \item At exact collapse, all centered means are zero and this derivative can
+ vanish. Start each comparison from the original source checkpoint, not an
+ already collapsed read-in.
+ \item Sample variance is unbiased, but its square root and the hinge are not.
+ Minibatches can activate the penalty even at a well-aligned source encoder.
+ Balanced batches reduce the small-tail problem, not all sampling noise.
+ \item The floor constrains diagonal spread, not cross-coordinate covariance,
+ trial identity, behavioral orientation, means, or decoding accuracy.
+ \item A target domain may legitimately have less variation than the source.
+ A strong floor can then manufacture unnecessary spread or oppose useful
+ adaptation. Fixed cue-relative timing also limits the validity of a
+ per-time-bin reference when movement timing differs.
+ \item A finite penalty weight does not guarantee the floor is attained.
+ Preserving source decoding by preventing all adaptation is not sufficient:
+ recovery of controlled synthetic shifts is a separate acceptance gate.
+\end{itemize}
+
+This is an \textbf{experimental stabilization variant}, not a term asserted
+to appear in the published ERDiff objective. Source self-checks identify a
+failure mode; they do not establish a research contribution or paper-level
+performance reproduction.
+
+\section{Implementation and controlled comparison}
+
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Control & Meaning\\
+\midrule
+\texttt{--mla\_variance\_weight} & $\lambda_v$, nonnegative; default 0.\\
+\texttt{--mla\_variance\_floor} & $\rho$, in $(0,1]$; default 0.9.\\
+\texttt{--alpha} & MLA/OT mixing weight; use 0 to isolate this experiment.\\
+\bottomrule
+\end{tabularx}
+
+\path{mla_stabilization.py} implements Eqs.~\eqref{eq:sourcevariance} and
+\eqref{eq:floor}. \path{train_phase2.py} adds the weighted penalty, reports
+its raw and weighted values, and saves the reference and configuration.
+Cross-day orchestration forwards corresponding optional flags. The existing
+fixed-noise MLA probes continue to measure the \emph{unmodified MLA component};
+they are not finite-difference checks of the new combined objective.
+The diagnostic variance ratios use population variance, whereas the constraint
+uses sample variance; this small denominator difference should be retained
+when reading detailed numerical values.
+
+The first planned comparison holds the following fixed: the same source
+checkpoint, source training/validation indices, model seed 42, split seed 42,
+probe seed 42, balanced batch policy, uniform source diffusion-time interval,
+Adam learning rate 0.001, and 50 epochs. Compare
+\begin{equation}
+ \lambda_v\in\{0,1,10\},\qquad\rho=0.9,\qquad\alpha=0.
+\end{equation}
+These are predetermined source-only diagnostic candidates, not validated
+hyperparameters. Each run restarts from the source checkpoint and writes to
+a separate directory. Examine posterior-mean trial variance, prediction
+variance, source validation $R^2$, penalty contribution, and clipping, including
+early epochs. Then require a known recoverable synthetic-domain shift before
+freezing settings for later target evaluation. Previously inspected target
+test scores must not select these candidates.
+
+\textbf{Verification boundary.} Focused tests were written for a zero deficit
+at matching source means, an outward deficit gradient, rejection of a one-trial
+batch, and detection of identical trials with a varying temporal template.
+They were not executed. No new training result, numerical validation of the
+constraint, typeset PDF, or performance improvement is claimed in this note.
+
+\begin{thebibliography}{9}\small
+\bibitem{erdiff}
+Y. Wang, Z. Wu, C. Li, and A. Wu.
+\emph{Extraction and Recovery of Spatio-Temporal Structure in Latent Dynamics
+Alignment with Diffusion Models}. NeurIPS, 2023.
+\href{https://proceedings.neurips.cc/paper_files/paper/2023/file/7abbcb05a5d55157ede410bb718e32d7-Paper-Conference.pdf}{Published paper},
+especially Eqs. 5, 26--28 and Algorithms 1--2.
+
+\bibitem{authorcode}
+ERDiff author implementation, pinned 2023 snapshot
+\texttt{ae49f74e7fee70a2e3ea8205bf54d937ec552103}.
+\url{https://github.com/yulewang97/ERDiff/tree/ae49f74e7fee70a2e3ea8205bf54d937ec552103}.
+The paper and this historical code are distinct references; later releases
+are not mixed into a single reproduction configuration.
+\end{thebibliography}
+\end{document}
