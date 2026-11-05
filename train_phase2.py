@@ -3,8 +3,9 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 
-from dataloader import get_nhp_dataloaders
+from dataloader import NHPDataset, get_nhp_dataloaders
 from vae import SequentialVAE, trajectory_smoothness_loss
 from diffusion import (
     LatentDiffusionModel,
@@ -34,19 +35,37 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+def clean_training_view(loader, batch_size: int):
+    """Visit every training trial once, without spike noise or random omission."""
+    dataset = loader.dataset
+    return DataLoader(
+        NHPDataset(dataset.spikes, dataset.velocities, dataset.targets,
+                   is_train=False, include_behavior=False),
+        batch_size=batch_size, shuffle=False, drop_last=False,
+    )
+
+
+def sample_latent_posterior(mu: torch.Tensor, logvar: torch.Tensor, noise=None):
+    """Sample q(z|x) even while the frozen encoder is in evaluation mode."""
+    if noise is None:
+        noise = torch.randn_like(mu)
+    return mu + torch.exp(0.5 * logvar) * noise
+
+
 @torch.no_grad()
 def extract_source_latent_bank(vae: SequentialVAE, source_loader, device: torch.device):
     """
-    Extracts clean deterministic source latent trajectories Z_0^(s)
-    for the Sinkhorn Divergence regularizer.
+    Extract posterior parameters for every clean source training trial.
     """
     vae.eval()
-    source_latents = []
+    source_means = []
+    source_logvars = []
     for batch in source_loader:
         spikes = batch["spikes"].to(device)
-        mu, _ = vae.encoder(spikes)
-        source_latents.append(mu)
-    return torch.cat(source_latents, dim=0)
+        mu, logvar = vae.encoder(spikes)
+        source_means.append(mu)
+        source_logvars.append(logvar)
+    return torch.cat(source_means, dim=0), torch.cat(source_logvars, dim=0)
 
 
 @torch.no_grad()
@@ -100,7 +119,7 @@ def train_epoch_phase2(
     diffusion_model: LatentDiffusionModel,
     scheduler: VPSDEScheduler,
     target_loader,
-    source_latents_bank: torch.Tensor,
+    source_latents_bank,
     optimizer: optim.Optimizer,
     device: torch.device,
     alpha: float = 0.5,
@@ -113,7 +132,8 @@ def train_epoch_phase2(
     diffusion_model.eval()        # Frozen score network
 
     total_loss = 0.0
-    num_source_samples = source_latents_bank.size(0)
+    source_mu, source_logvar = source_latents_bank
+    num_source_samples = source_mu.size(0)
 
     for batch in target_loader:
         target_spikes = batch["spikes"].to(device)
@@ -121,18 +141,19 @@ def train_epoch_phase2(
 
         optimizer.zero_grad()
 
-        # 1. Forward pass through encoder using deterministic continuous trajectory mu_t
-        mu_t, _ = vae.encoder(target_spikes)
+        # Algorithm 2 samples target latents from the encoder posterior.
+        mu_t, logvar_t = vae.encoder(target_spikes)
+        z_target = sample_latent_posterior(mu_t, logvar_t)
 
         # 2. Sample matching batch of source latents for Sinkhorn regularizer
         perm = torch.randperm(num_source_samples, device=device)[:batch_size]
-        z_source_batch = source_latents_bank[perm]
+        z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm])
 
         # 3. Compute MLA + Sinkhorn + Trajectory Smoothness
         loss_align = total_alignment_loss(
             diffusion_model=diffusion_model,
             scheduler=scheduler,
-            z_target=mu_t,
+            z_target=z_target,
             z_source=z_source_batch,
             alpha=alpha,
         )
@@ -185,7 +206,7 @@ def main():
         file_path=args.source_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
-        augment_multiplier=1,  # Clean source bank
+        augment_multiplier=1,
         split_seed=checkpoint["split_seed"],
         split_indices=checkpoint["split_indices"],
     )
@@ -205,6 +226,8 @@ def main():
         include_behavior=False,
     )
     print(f"Source neurons: {n_src_neurons} | Target neurons: {n_tgt_neurons}")
+    clean_source_loader = clean_training_view(src_train_loader, args.batch_size)
+    clean_target_loader = clean_training_view(tgt_train_loader, args.batch_size)
 
     # 2. Restore Source Models from Phase 1
     latent_dim = checkpoint["latent_dim"]
@@ -229,13 +252,13 @@ def main():
 
     # 3. Precompute Source Latent Bank
     print("Pre-computing source domain latent bank...")
-    source_latents_bank = extract_source_latent_bank(vae, src_train_loader, device)
+    source_latents_bank = extract_source_latent_bank(vae, clean_source_loader, device)
 
     # 4. Initialize Target Read-In (handles both equal and mismatched neuron counts)
     warm_read_in = initialize_target_read_in(
         source_read_in=vae.encoder.read_in,
-        src_loader=src_train_loader,
-        tgt_loader=tgt_train_loader,
+        src_loader=clean_source_loader,
+        tgt_loader=clean_target_loader,
         n_src_neurons=n_src_neurons,
         n_tgt_neurons=n_tgt_neurons,
         hidden_dim=hidden_dim,
