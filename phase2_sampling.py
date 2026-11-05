@@ -1,7 +1,18 @@
 """Balanced optimization batches, separate from deterministic statistics loaders."""
 
+import hashlib
+
 import torch
 from torch.utils.data import DataLoader, Sampler
+
+
+def derive_seed(seed: int, namespace: str) -> int:
+    digest = hashlib.sha256(f"{int(seed)}|{namespace}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (2**63 - 1)
+
+
+def source_sampling_generator(seed: int):
+    return torch.Generator(device="cpu").manual_seed(derive_seed(seed, "source-bank-trial-selection"))
 
 
 class BalancedBatchSampler(Sampler):
@@ -26,7 +37,9 @@ class BalancedBatchSampler(Sampler):
 def make_alignment_loader(dataset, max_batch_size: int, seed: int):
     return DataLoader(
         dataset,
-        batch_sampler=BalancedBatchSampler(len(dataset), max_batch_size, seed),
-        # Keep iterator seed draws separate from posterior and diffusion noise.
-        generator=torch.Generator().manual_seed(seed),
+        batch_sampler=BalancedBatchSampler(
+            len(dataset), max_batch_size, derive_seed(seed, "alignment-batch-order")
+        ),
+        # DataLoader's iterator stream is distinct from batch order and latent noise.
+        generator=torch.Generator().manual_seed(derive_seed(seed, "alignment-loader")),
     )

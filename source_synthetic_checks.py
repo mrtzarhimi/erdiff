@@ -15,8 +15,9 @@ from decoder_models import compute_r2_score, compute_rmse
 from diffusion import LatentDiffusionModel, VPSDEScheduler
 from mla_diagnostics import MLADiagnostics, variance_summary
 from mla_stabilization import source_trial_variance
+from alignment_noise_bank import AlignmentNoiseBank
 from phase2_freeze_guard import FrozenDiffusionGuard
-from phase2_sampling import make_alignment_loader
+from phase2_sampling import make_alignment_loader, source_sampling_generator
 from synthetic_shifts import apply_shift, make_shift, oracle_readin_weight, validation_development_split
 from train_phase2 import clean_training_view, extract_source_latent_bank, set_seed, train_epoch_phase2
 from vae import SequentialVAE
@@ -72,11 +73,17 @@ def main():
     parser.add_argument("--mla_variance_floor", type=float, default=0.9)
     parser.add_argument("--mla_variance_scope", choices=("batch", "full_train"), default="full_train")
     parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument("--alignment_noise_mode", choices=("resampled", "fixed_bank"), default="resampled")
+    parser.add_argument("--noise_seed", type=int, default=42)
+    parser.add_argument("--noise_bank_replicates", type=int, default=8)
+    parser.add_argument("--noise_bank_path", default=None)
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 2 or not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError("Use positive epochs/lr and batch size >= 2.")
     if not 0 < args.mla_variance_floor <= 1 or any(not math.isfinite(w) or w < 0 for w in args.weights):
         raise ValueError("Variance floor must be in (0, 1] and weights finite/nonnegative.")
+    if args.noise_bank_replicates < 1:
+        raise ValueError("Noise bank replicate count must be positive.")
 
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -122,10 +129,26 @@ def main():
     if not probe_times:
         probe_times = [(scheduler.t_min + scheduler.T) / 2]
     bank = extract_source_latent_bank(source, clean_training_view(train, args.batch_size), device)
-    reference_variance = source_trial_variance(bank[0])
+    reference_variance = source_trial_variance(bank.mu)
     clean_predictions = predict(source, validation_spikes[evaluation_offsets], device, args.batch_size)
     clean_metrics = metrics(clean_predictions, evaluation_velocity, checkpoint)
     shifts = {kind: make_shift(kind, n_neurons, args.shift_seed, args.mask_fraction) for kind in args.shifts}
+    noise_bank_path = args.noise_bank_path or str(output / "alignment_noise_bank.pt")
+    noise_bank = None
+    source_noise_domain = f"source:{source_hash}"
+    target_noise_domains = {kind: f"synthetic-target:{kind}:{source_hash}" for kind in shifts}
+    if args.alignment_noise_mode == "fixed_bank":
+        if Path(noise_bank_path).is_file():
+            noise_bank = AlignmentNoiseBank.load(
+                noise_bank_path, seed=args.noise_seed, replicates=args.noise_bank_replicates
+            )
+        else:
+            noise_bank = AlignmentNoiseBank(args.noise_seed, args.noise_bank_replicates)
+        noise_bank.register_domain(source_noise_domain, bank.trial_ids, args.seq_len, checkpoint["latent_dim"])
+        for kind, domain in target_noise_domains.items():
+            noise_bank.register_domain(
+                domain, validation_ids[adaptation_offsets], args.seq_len, checkpoint["latent_dim"]
+            )
     torch.save({
         "protocol": "source_validation_development_v1", "arguments": vars(args),
         "source_checkpoint_sha256": source_hash, "source_data_sha256": data_hash,
@@ -133,6 +156,11 @@ def main():
         "adaptation_indices": validation_ids[adaptation_offsets],
         "evaluation_indices": validation_ids[evaluation_offsets],
         "validation_window_intervals": intervals, "shifts": shifts,
+        "alignment_noise_mode": args.alignment_noise_mode,
+        "noise_seed": args.noise_seed,
+        "noise_bank_replicates": args.noise_bank_replicates,
+        "noise_bank_path": noise_bank_path if noise_bank is not None else None,
+        "probe_noise_namespace": "independent_mla_diagnostics_fixture",
     }, output / "synthetic_manifest.pt")
     print(f"Source-only development: adaptation={len(adaptation_offsets)}, evaluation={len(evaluation_offsets)}")
     print(f"Clean source evaluation R2={clean_metrics['r2']:.2f}% | source SHA256={source_hash}")
@@ -143,7 +171,8 @@ def main():
         adaptation_spikes = apply_shift(validation_spikes[adaptation_offsets], shift)
         evaluation_spikes = apply_shift(validation_spikes[evaluation_offsets], shift)
         dataset = NHPDataset(adaptation_spikes, torch.zeros(len(adaptation_spikes), args.seq_len, 2),
-                             torch.zeros(len(adaptation_spikes), dtype=torch.long), include_behavior=False)
+                             torch.zeros(len(adaptation_spikes), dtype=torch.long), include_behavior=False,
+                             trial_ids=validation_ids[adaptation_offsets])
         oracle_weight = oracle_readin_weight(source.encoder.read_in.weight, shift)
         oracle_r2, oracle_error = None, None
         if oracle_weight is not None:
@@ -163,6 +192,7 @@ def main():
             model = copy.deepcopy(source)
             loader = make_alignment_loader(dataset, args.batch_size, args.seed)
             optimizer = torch.optim.Adam(model.encoder.read_in.parameters(), lr=args.lr)
+            source_rng = source_sampling_generator(args.seed)
             pool = adaptation_spikes.to(device) if args.mla_variance_scope == "full_train" else None
             run_dir = output / f"{kind}_w{weight:g}"
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -180,7 +210,11 @@ def main():
                     dataset, validation_ids[adaptation_offsets], checkpoint["latent_dim"],
                     probe_times, args.seed, 16, str(run_dir),
                     context={"shift": kind, "variance_weight": weight, "scope": args.mla_variance_scope,
-                             "seed": args.seed, "split_seed": args.split_seed, "shift_seed": args.shift_seed},
+                             "seed": args.seed, "split_seed": args.split_seed, "shift_seed": args.shift_seed,
+                             "alignment_noise_mode": args.alignment_noise_mode,
+                             "noise_seed": args.noise_seed,
+                             "noise_bank_replicates": args.noise_bank_replicates,
+                             "probe_noise_is_independent_of_fit_bank": True},
                 )
                 diagnostics.record(0, model, denoiser, scheduler, device, args.batch_size)
             history = [{"epoch": 0, "evaluation": before}]
@@ -192,6 +226,11 @@ def main():
                     source_variance=reference_variance, mla_variance_weight=weight,
                     mla_variance_floor=args.mla_variance_floor, mla_variance_scope=args.mla_variance_scope,
                     variance_pool_spikes=pool,
+                    noise_bank=noise_bank,
+                    noise_replicate=(epoch - 1) % args.noise_bank_replicates,
+                    source_sampling_rng=source_rng,
+                    target_noise_domain=target_noise_domains[kind],
+                    source_noise_domain=source_noise_domain,
                 )
                 denoiser_guard.verify_or_record_failure(
                     (optimizer,), failure_path=str(failure_path),
@@ -240,6 +279,13 @@ def main():
             del model, optimizer
 
     print(f"Saved source-only development summary: {output / 'summary.csv'}")
+    if noise_bank is not None:
+        noise_bank_hash = noise_bank.save(noise_bank_path)
+        with open(output / "alignment_noise_bank_manifest.json", "w", encoding="utf-8") as handle:
+            json.dump({"path": str(Path(noise_bank_path).resolve()), "sha256": noise_bank_hash,
+                       "seed": args.noise_seed, "replicates": args.noise_bank_replicates,
+                       "domains": sorted(noise_bank.domains)}, handle, indent=2, sort_keys=True)
+            handle.write("\n")
 
 
 if __name__ == "__main__":

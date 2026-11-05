@@ -67,13 +67,15 @@
 
 **Interfaces:** `SourcePosteriorBank` holds `mu`, `logvar`, and `trial_ids`; replace current tuple consumers consistently. `NoiseBatch` holds posterior eta, diffusion epsilon and uniform time draws. `AlignmentNoiseBank.get(domain: str, trial_ids: Tensor, replicate: int) -> NoiseBatch`. Domain namespaces distinguish source/target and training/probes. `NHPDataset(..., trial_ids=None)` preserves original extracted IDs across repeated views.
 
-- [ ] Write checks for exact replay under batch permutation, independent eta/epsilon streams, distinct probe draws, unchanged Gaussian arrays across noise-level ablations, and no global RNG changes.
-- [ ] Add `--alignment_noise_mode resampled|fixed_bank`, `--noise_seed`, `--noise_bank_replicates` (8). Default remains resampled. Key each fixed draw by domain, stable trial ID and replicate; cycle replicate `epoch_index % R`. Save the bank and its hash for reuse, rejecting incompatible identities/shapes.
-- [ ] Fix posterior noise for source OT samples as well as target posterior/diffusion draws in fixed-bank mode. Preserve source/target independence even in a self-check. Source-bank trial selection and balanced sample order retain independent saved RNG streams.
-- [ ] Route existing fixed-time/ranged-time controls through stored uniform draws. Never replace Gaussian noise with all zeros or one vector shared across all trials.
-- [ ] Record that finite-bank fitting is a variant and use independent source-development probe noise to inspect corruption overfitting.
+- [x] Write checks for exact replay under batch permutation, independent eta/epsilon streams, distinct probe draws, unchanged Gaussian arrays across noise-level ablations, and no global RNG changes.
+- [x] Add `--alignment_noise_mode resampled|fixed_bank`, `--noise_seed`, `--noise_bank_replicates` (8). Default remains resampled. Key each fixed draw by domain, stable trial ID and replicate; cycle replicate `epoch_index % R`. Save the bank and its hash for reuse, rejecting incompatible identities/shapes.
+- [x] Fix posterior noise for source OT samples as well as target posterior/diffusion draws in fixed-bank mode. Preserve source/target independence even in a self-check. Source-bank trial selection and balanced sample order retain independent saved RNG streams.
+- [x] Route existing fixed-time/ranged-time controls through stored uniform draws. Never replace Gaussian noise with all zeros or one vector shared across all trials.
+- [x] Record that finite-bank fitting is a variant and use independent source-development probe noise to inspect corruption overfitting.
 - [ ] When authorized: `pytest tests/test_alignment_noise_bank.py tests/test_mla_noise_levels.py -q`; expected tests pass. Otherwise mark unrun.
-- [ ] Commit: `feat: add reproducible trial-indexed Gaussian noise banks`.
+- [x] Commit: `feat: add reproducible trial-indexed Gaussian noise banks`.
+
+**Execution note:** fixed draws and their cache are integrated in Phase 2 and source-synthetic development; the requested tests are written but remain unrun under the user's no-execution instruction.
 
 ### Task 4: Add optional width matching without hiding initialization changes
 

@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -28,6 +29,14 @@ from phase2_run_manifest import (
     validate_reference_compatibility,
     validate_resolved_config,
 )
+from phase2_sampling import derive_seed, source_sampling_generator
+
+
+@dataclass(frozen=True)
+class SourcePosteriorBank:
+    mu: torch.Tensor
+    logvar: torch.Tensor
+    trial_ids: torch.Tensor
 
 
 def set_seed(seed: int = 42):
@@ -76,7 +85,11 @@ def extract_source_latent_bank(vae: SequentialVAE, source_loader, device: torch.
         source_means.append(mu)
         source_logvars.append(logvar)
         source_trial_ids.append(batch["trial_id"])
-    return torch.cat(source_means, dim=0), torch.cat(source_logvars, dim=0), torch.cat(source_trial_ids)
+    return SourcePosteriorBank(
+        mu=torch.cat(source_means, dim=0),
+        logvar=torch.cat(source_logvars, dim=0),
+        trial_ids=torch.cat(source_trial_ids),
+    )
 
 
 @torch.no_grad()
@@ -157,6 +170,9 @@ def train_epoch_phase2(
     gradient_balance="none",
     ot_scale=1.0,
     log_component_gradients=False,
+    source_sampling_rng=None,
+    target_noise_domain="target",
+    source_noise_domain="source",
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
@@ -176,7 +192,9 @@ def train_epoch_phase2(
     sample_exposures = 0
     full_variance_forwards = 0
     full_variance_sample_exposures = 0
-    source_mu, source_logvar, source_trial_ids = source_latents_bank
+    source_mu = source_latents_bank.mu
+    source_logvar = source_latents_bank.logvar
+    source_trial_ids = source_latents_bank.trial_ids
     num_source_samples = source_mu.size(0)
 
     for batch in target_loader:
@@ -192,16 +210,24 @@ def train_epoch_phase2(
         if noise_bank is None:
             z_target = sample_latent_posterior(mu_t, logvar_t)
         else:
-            target_noise = noise_bank.get("target", batch["trial_id"], noise_replicate,
+            target_noise = noise_bank.get(target_noise_domain, batch["trial_id"], noise_replicate,
                                           mu_t.shape[1], mu_t.shape[2], device)
             z_target = sample_latent_posterior(mu_t, logvar_t, target_noise.posterior_eta)
 
         # 2. Sample matching batch of source latents for Sinkhorn regularizer
-        perm = torch.randperm(num_source_samples, device=device)[:batch_size]
+        if source_sampling_rng is None:
+            perm = torch.randperm(num_source_samples, device=device)[:batch_size]
+            selected_source_ids = source_trial_ids[perm.detach().cpu()]
+        else:
+            source_indices_cpu = torch.randperm(
+                num_source_samples, generator=source_sampling_rng
+            )[:batch_size]
+            perm = source_indices_cpu.to(device)
+            selected_source_ids = source_trial_ids[source_indices_cpu]
         if noise_bank is None:
             z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm])
         else:
-            source_noise = noise_bank.get("source", source_trial_ids[perm], noise_replicate,
+            source_noise = noise_bank.get(source_noise_domain, selected_source_ids, noise_replicate,
                                           source_mu.shape[1], source_mu.shape[2], device)
             z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm], source_noise.posterior_eta)
             low = scheduler.t_min if mla_t_min is None else mla_t_min
@@ -314,6 +340,8 @@ def main():
     parser.add_argument("--alignment_noise_mode", choices=("resampled", "fixed_bank"), default="resampled")
     parser.add_argument("--noise_seed", type=int, default=42)
     parser.add_argument("--noise_bank_replicates", type=int, default=8)
+    parser.add_argument("--noise_bank_path", type=str, default=None,
+                        help="Optional saved bank path; fixed_bank loads/reuses it or creates it there")
     parser.add_argument("--log_component_gradients", action="store_true")
     parser.add_argument("--augment_mult", type=int, default=3, help="Target data repetition when --augment_target is enabled")
     parser.add_argument("--augment_target", action="store_true", help="Experimental variant: augment target adaptation spikes")
@@ -364,6 +392,8 @@ def main():
         raise ValueError("MLA variance weight must be finite and nonnegative.")
     if not math.isfinite(args.mla_variance_floor) or not 0 < args.mla_variance_floor <= 1:
         raise ValueError("MLA variance floor must lie in (0, 1].")
+    if args.noise_bank_replicates < 1:
+        raise ValueError("Noise bank replicate count must be positive.")
 
     if args.mla_diagnostics_only:
         args.mla_diagnostics = True
@@ -491,6 +521,8 @@ def main():
         "optimizer_eps": 1e-8,
         "gradient_clip_norm": 1.0,
         "batch_sampler": "seeded_balanced_shuffle",
+        "source_sampling_seed": derive_seed(args.seed, "source-bank-trial-selection"),
+        "alignment_batch_seed": derive_seed(args.seed, "alignment-batch-order"),
         "diffusion_beta_min": noise_config["beta_min"],
         "diffusion_beta_max": noise_config["beta_max"],
         "diffusion_T": noise_config["T"],
@@ -547,13 +579,29 @@ def main():
     # 3. Precompute Source Latent Bank
     print("Pre-computing source domain latent bank...")
     source_latents_bank = extract_source_latent_bank(vae, clean_source_loader, device)
-    noise_bank = (AlignmentNoiseBank(args.noise_seed, args.noise_bank_replicates)
-                  if args.alignment_noise_mode == "fixed_bank" else None)
+    noise_bank_path = args.noise_bank_path or os.path.join(args.save_dir, "alignment_noise_bank.pt")
+    noise_bank = None
+    source_noise_domain = f"source:{source_fingerprint}"
+    target_noise_domain = f"target:{data_fingerprints['target']['sha256']}"
+    if args.alignment_noise_mode == "fixed_bank":
+        if os.path.isfile(noise_bank_path):
+            noise_bank = AlignmentNoiseBank.load(
+                noise_bank_path, seed=args.noise_seed, replicates=args.noise_bank_replicates
+            )
+        else:
+            noise_bank = AlignmentNoiseBank(args.noise_seed, args.noise_bank_replicates)
+        noise_bank.register_domain(
+            source_noise_domain, source_latents_bank.trial_ids, args.seq_len, latent_dim
+        )
+        noise_bank.register_domain(
+            target_noise_domain, optimization_dataset.trial_ids, args.seq_len, latent_dim
+        )
+    source_rng = source_sampling_generator(args.seed)
     source_variance = None
     variance_pool_spikes = None
     if args.mla_variance_weight > 0 and args.alpha < 1.0:
         from mla_stabilization import source_trial_variance
-        source_variance = source_trial_variance(source_latents_bank[0])
+        source_variance = source_trial_variance(source_latents_bank.mu)
         variance_trials = len(clean_target_loader.dataset)
         if args.mla_variance_scope == "batch":
             variance_trials = len(optimization_dataset) // len(alignment_loader)
@@ -670,6 +718,9 @@ def main():
             noise_bank=noise_bank,
             noise_replicate=(epoch - 1) % args.noise_bank_replicates,
             log_component_gradients=args.log_component_gradients,
+            source_sampling_rng=source_rng,
+            target_noise_domain=target_noise_domain,
+            source_noise_domain=source_noise_domain,
         )
         if args.frozen_check == "every_epoch":
             diffusion_guard.verify_or_record_failure(
@@ -738,6 +789,9 @@ def main():
     if resolved_reference is not None:
         recorded_config.update(resolved_reference["resolved_config"])
     recorded_config.update(runtime_config)
+    noise_bank_hash = None
+    if noise_bank is not None:
+        noise_bank_hash = noise_bank.save(noise_bank_path)
     manifest = build_run_manifest(
         config=recorded_config,
         source_checkpoint=args.source_checkpoint,
@@ -763,6 +817,12 @@ def main():
     manifest["source_training_config"] = checkpoint.get("training_config")
     manifest["source_training_seed"] = checkpoint.get("training_seed")
     manifest["source_selected_epoch"] = checkpoint.get("epoch")
+    manifest["alignment_noise_bank_path"] = (
+        os.path.realpath(noise_bank_path) if noise_bank is not None else None
+    )
+    manifest["alignment_noise_bank_sha256"] = noise_bank_hash
+    manifest["finite_bank_is_training_variant"] = noise_bank is not None
+    manifest["probe_noise_namespace"] = "independent_mla_diagnostics_fixture"
     manifest["exact_reproduction_claimable"] = exact_reproduction_claimable(manifest)
     manifest_path = os.path.join(args.save_dir, "phase2_run_manifest.json")
     save_run_manifest(manifest_path, manifest)
@@ -788,6 +848,11 @@ def main():
             "sample_exposures": sample_exposures,
             "full_variance_forwards": full_variance_forwards,
             "full_variance_sample_exposures": full_variance_sample_exposures,
+            "alignment_noise_bank_path": manifest["alignment_noise_bank_path"],
+            "alignment_noise_bank_sha256": noise_bank_hash,
+            "source_sampling_rng_state": source_rng.get_state(),
+            "alignment_batch_order_rng_state": alignment_loader.batch_sampler.generator.get_state(),
+            "alignment_loader_rng_state": alignment_loader.generator.get_state(),
             "source_data_fingerprint": data_fingerprints["source"],
             "target_data_fingerprint": data_fingerprints["target"],
             "preprocessing": target_data_metadata["preprocessing"],
