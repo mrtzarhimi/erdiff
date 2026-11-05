@@ -75,7 +75,7 @@ def plot_cross_day_drift(df: pd.DataFrame, save_path: str):
         linestyle="--",
         color="gray",
         linewidth=2,
-        label="Pre-alignment warm start",
+        label="Pre-alignment baseline",
     )
     plt.plot(
         df["days_elapsed"],
@@ -112,6 +112,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--phase1_epochs", type=int, default=200, help="Epochs for Phase 1 source training")
     parser.add_argument("--phase2_epochs", type=int, default=150, help="Epochs for Phase 2 alignment per day")
+    parser.add_argument("--phase2_lr", type=float, default=0.001, help="Target read-in learning rate")
+    parser.add_argument("--phase2_alpha", type=float, default=0.5, help="Paper MLA/transport mixing weight")
+    parser.add_argument("--phase2_ot_epsilon", type=float, default=0.1, help="Transport entropy weight")
+    parser.add_argument("--phase2_smooth_weight", type=float, default=0.0, help="Optional smoothness variant")
+    parser.add_argument("--phase2_readin_init", choices=("source_or_random", "ridge"), default="source_or_random")
+    parser.add_argument("--phase2_augment_target", action="store_true", help="Experimental target-spike augmentation")
     parser.add_argument("--force_phase1", action="store_true", help="Force re-training Phase 1 even if ckpt exists")
     args = parser.parse_args()
 
@@ -185,12 +191,17 @@ def main():
             "--save_dir", args.checkpoints_dir,
             "--seq_len", str(args.seq_len),
             "--batch_size", str(args.batch_size),
-            "--lr", "0.002",
-            "--weight_decay", "0.001",
+            "--lr", str(args.phase2_lr),
+            "--weight_decay", "0.0",
             "--epochs", str(args.phase2_epochs),
             "--augment_mult", "3",
-            "--alpha", "0.5",
+            "--alpha", str(args.phase2_alpha),
+            "--ot_epsilon", str(args.phase2_ot_epsilon),
+            "--smooth_weight", str(args.phase2_smooth_weight),
+            "--readin_init", args.phase2_readin_init,
         ]
+        if args.phase2_augment_target:
+            cmd_p2.append("--augment_target")
         subprocess.run(cmd_p2, check=True)
 
         # Rename saved Phase 2 checkpoint to session-specific filename

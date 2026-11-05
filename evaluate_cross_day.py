@@ -186,7 +186,7 @@ def main():
     }
     vae.load_state_dict(filtered_base_state, strict=False)
 
-    # 3. Pre-alignment warm-start baseline. The initial read-in may use target
+    # 3. Pre-alignment initialization baseline. A ridge variant may use target
     # training spikes when neuron counts differ, so this is not raw direct transfer.
     if "unaligned_read_in_state" in aligned_ckpt:
         vae.encoder.read_in.load_state_dict(aligned_ckpt["unaligned_read_in_state"])
@@ -233,7 +233,7 @@ def main():
     print(f"Target Session       : {os.path.basename(args.target_data_path)}")
     print(f"Target Neurons       : {n_tgt_neurons}")
     print("-" * 55)
-    print(f"Pre-alignment warm start: R^2 = {r2_unaligned:6.2f}% | RMSE = {rmse_unaligned:.4f}")
+    print(f"Pre-alignment baseline: R^2 = {r2_unaligned:6.2f}% | RMSE = {rmse_unaligned:.4f}")
     print(f"ERDiff Aligned       : R^2 = {r2_aligned:6.2f}% | RMSE = {rmse_aligned:.4f}")
     print(f"Absolute Gain        : dR^2 = {r2_aligned - r2_unaligned:+6.2f}% | dRMSE = {rmse_aligned - rmse_unaligned:+6.4f}")
     print("=" * 55)

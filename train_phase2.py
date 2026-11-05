@@ -77,20 +77,27 @@ def initialize_target_read_in(
     n_tgt_neurons: int,
     hidden_dim: int,
     device: torch.device,
+    init_mode: str = "source_or_random",
 ) -> nn.Linear:
     """
     Initializes target read_in layer.
     - If neuron counts match, copies source read_in weights directly.
-    - If neuron counts differ (e.g. 96 -> 92 due to dropped electrodes), computes
-      a regularized linear projection mapping target trial-averaged neural profiles
-      onto source hidden activations so target latents start inside the source manifold.
+    - If neuron counts differ, a fresh target read-in matches the 2023 author code.
+      The previous ridge warm start remains an optional experimental variant.
     """
     new_read_in = nn.Linear(n_tgt_neurons, hidden_dim).to(device)
-    new_read_in.bias.copy_(source_read_in.bias)
+    if init_mode not in ("source_or_random", "ridge"):
+        raise ValueError(f"Unknown target read-in initialization: {init_mode}")
 
     if n_tgt_neurons == n_src_neurons:
+        new_read_in.bias.copy_(source_read_in.bias)
         new_read_in.weight.copy_(source_read_in.weight)
         return new_read_in
+
+    if init_mode == "source_or_random":
+        return new_read_in
+
+    new_read_in.bias.copy_(source_read_in.bias)
 
     # Gather temporal mean profile across training trials: shape (seq_len, n_neurons)
     src_batches = [b["spikes"].to(device) for b in src_loader]
@@ -186,10 +193,13 @@ def main():
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins per trial")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.002, help="Learning rate for linear probing")
-    parser.add_argument("--weight_decay", type=float, default=1e-3, help="L2 regularization on read-in")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for target read-in probing")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="Optional read-in weight decay variant")
     parser.add_argument("--epochs", type=int, default=150, help="Alignment epochs")
-    parser.add_argument("--augment_mult", type=int, default=3, help="Target data augmentation multiplier")
+    parser.add_argument("--augment_mult", type=int, default=3, help="Target data repetition when --augment_target is enabled")
+    parser.add_argument("--augment_target", action="store_true", help="Experimental variant: augment target adaptation spikes")
+    parser.add_argument("--readin_init", choices=("source_or_random", "ridge"), default="source_or_random",
+                        help="Initialize equal-width read-ins from source; use random or ridge for changed neuron counts")
     parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off weighting Sinkhorn loss")
     parser.add_argument("--ot_epsilon", type=float, default=0.1, help="Entropy weight for full-trajectory transport")
     parser.add_argument("--sinkhorn_iters", type=int, default=100, help="Log-domain transport scaling iterations")
@@ -272,6 +282,7 @@ def main():
         n_tgt_neurons=n_tgt_neurons,
         hidden_dim=hidden_dim,
         device=device,
+        init_mode=args.readin_init,
     )
     vae.encoder.read_in = warm_read_in
     vae.freeze_for_alignment()
@@ -279,7 +290,7 @@ def main():
     for param in diffusion_model.parameters():
         param.requires_grad = False
 
-    alignment_optimizer = optim.AdamW(
+    alignment_optimizer = optim.Adam(
         vae.encoder.read_in.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -297,7 +308,7 @@ def main():
             vae=vae,
             diffusion_model=diffusion_model,
             scheduler=scheduler,
-            target_loader=tgt_train_loader,
+            target_loader=tgt_train_loader if args.augment_target else clean_target_loader,
             source_latents_bank=source_latents_bank,
             optimizer=alignment_optimizer,
             device=device,
@@ -331,8 +342,11 @@ def main():
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
                 "augment_mult": args.augment_mult,
+                "augment_target": args.augment_target,
+                "readin_init": args.readin_init,
                 "seed": args.seed,
                 "batch_size": args.batch_size,
+                "optimizer": "Adam",
             },
         },
         save_path,
