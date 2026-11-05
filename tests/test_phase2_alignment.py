@@ -3,8 +3,9 @@ import math
 from torch.utils.data import DataLoader
 
 from dataloader import NHPDataset
-from diffusion import sinkhorn_loss
-from train_phase2 import clean_training_view, sample_latent_posterior
+from diffusion import VPSDEScheduler, sinkhorn_loss
+from train_phase2 import clean_training_view
+from vae import sample_latent_posterior
 
 
 def test_clean_training_view_visits_each_source_trial_once_without_noise():
@@ -26,6 +27,17 @@ def test_alignment_samples_posterior_while_encoder_is_in_eval_mode():
     noise = torch.tensor([[[3.0]]])
 
     assert torch.equal(sample_latent_posterior(mu, logvar, noise), torch.tensor([[[5.0]]]))
+
+
+def test_vp_forward_noise_matches_constant_beta_marginal():
+    scheduler = VPSDEScheduler(beta_min=2.0, beta_max=2.0)
+    z0 = torch.tensor([[[2.0]]])
+    noise = torch.tensor([[[3.0]]])
+    noisy, returned_noise = scheduler.add_noise(z0, torch.tensor([0.5]), noise)
+    expected = 2.0 * math.exp(-0.5) + 3.0 * math.sqrt(1.0 - math.exp(-1.0))
+
+    assert torch.allclose(noisy, torch.tensor([[[expected]]]))
+    assert torch.equal(returned_noise, noise)
 
 
 def test_transport_uses_full_squared_trajectory_cost_and_gradient():

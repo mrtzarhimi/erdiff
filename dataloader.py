@@ -43,7 +43,7 @@ class NHPDataset(Dataset):
         base_idx = idx % self.spikes.shape[0]
         spk = self.spikes[base_idx].clone()
 
-        if self.is_train:
+        if self.is_train and self.noise_transform.factor > 0:
             spk = self.noise_transform(spk)
             spk = torch.clamp(spk, min=0.0)
 
@@ -270,6 +270,7 @@ def get_nhp_dataloaders(
     include_validation: bool = True,
     include_test: bool = True,
     include_behavior: bool = True,
+    train_noise_factor: float = 0.08,
 ):
     x_data, y_data, targets, window_intervals = load_nhp_session(
         file_path=file_path, seq_len=seq_len, bin_width_s=bin_width_s
@@ -338,6 +339,7 @@ def get_nhp_dataloaders(
     train_dataset = NHPDataset(
         x_train, y_train, t_train, is_train=True, augment_multiplier=augment_multiplier,
         include_behavior=include_behavior,
+        noise_factor=train_noise_factor,
     )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 

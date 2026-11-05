@@ -184,10 +184,16 @@ class VPSDEScheduler:
       mu_t = exp(-0.5 * int_0^t beta(s) ds)
       Sigma_t = (1 - mu_t^2) * I
     """
-    def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0, T: float = 1.0):
+    def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0, T: float = 1.0, t_min: float = 0.001):
+        if beta_min <= 0 or beta_max < beta_min or not 0 <= t_min < T:
+            raise ValueError("VP noise requires positive ordered beta values and 0 <= t_min < T.")
         self.beta_min = beta_min
         self.beta_max = beta_max
         self.T = T
+        self.t_min = t_min
+
+    def sample_timesteps(self, batch_size: int, device):
+        return torch.rand(batch_size, device=device) * (self.T - self.t_min) + self.t_min
 
     def marginal_params(self, t: torch.Tensor):
         # Integral of beta(s) from 0 to t
@@ -221,7 +227,7 @@ def dsm_loss(
     """
     batch_size = z_0.size(0)
     # Uniformly sample continuous timesteps t in [0.001, T]
-    t = torch.rand(batch_size, device=z_0.device) * (scheduler.T - 0.001) + 0.001
+    t = scheduler.sample_timesteps(batch_size, z_0.device)
     eps = torch.randn_like(z_0)
 
     z_t, _ = scheduler.add_noise(z_0, t, eps)
@@ -242,7 +248,7 @@ def mla_loss(
     The diffusion model is FROZEN. The gradient flows back through z_t into z_0_target (and the encoder).
     """
     batch_size = z_0_target.size(0)
-    t = torch.rand(batch_size, device=z_0_target.device) * (scheduler.T - 0.001) + 0.001
+    t = scheduler.sample_timesteps(batch_size, z_0_target.device)
     eps = torch.randn_like(z_0_target)
 
     # Differentiable forward diffusion of target latents

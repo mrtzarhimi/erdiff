@@ -6,7 +6,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from dataloader import NHPDataset, get_nhp_dataloaders
-from vae import SequentialVAE, trajectory_smoothness_loss
+from vae import SequentialVAE, trajectory_smoothness_loss, sample_latent_posterior
 from diffusion import (
     LatentDiffusionModel,
     VPSDEScheduler,
@@ -43,13 +43,6 @@ def clean_training_view(loader, batch_size: int):
                    is_train=False, include_behavior=False),
         batch_size=batch_size, shuffle=False, drop_last=False,
     )
-
-
-def sample_latent_posterior(mu: torch.Tensor, logvar: torch.Tensor, noise=None):
-    """Sample q(z|x) even while the frozen encoder is in evaluation mode."""
-    if noise is None:
-        noise = torch.randn_like(mu)
-    return mu + torch.exp(0.5 * logvar) * noise
 
 
 @torch.no_grad()
@@ -238,6 +231,12 @@ def main():
 
     # 1. Load Source and Target Data
     checkpoint = torch.load(args.source_checkpoint, map_location=device)
+    noise_config = checkpoint.get("diffusion_training", {})
+    if noise_config.get("latent_distribution") != "posterior_sample":
+        raise ValueError(
+            "Source diffusion checkpoint was not trained on posterior samples. "
+            "Retrain Phase 1 before using paper-form posterior sampling in Phase 2."
+        )
     if "split_indices" not in checkpoint or "split_seed" not in checkpoint:
         raise ValueError("Source checkpoint is missing saved trial splits; retrain Phase 1.")
     if "velocity_mean" not in checkpoint or "velocity_std" not in checkpoint:
@@ -322,7 +321,10 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = VPSDEScheduler()
+    scheduler = VPSDEScheduler(
+        beta_min=noise_config["beta_min"], beta_max=noise_config["beta_max"],
+        T=noise_config["T"], t_min=noise_config["t_min"],
+    )
 
     # Save the initialization for a paired, pre-alignment target baseline.
     unaligned_read_in_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
@@ -363,6 +365,7 @@ def main():
             "velocity_mean": checkpoint_velocity_stats["velocity_mean"],
             "velocity_std": checkpoint_velocity_stats["velocity_std"],
             "alignment_epochs": args.epochs,
+            "diffusion_training": noise_config,
             "alignment_updates": args.epochs * len(tgt_train_loader if args.augment_target else clean_target_loader),
             "split_indices": target_data_metadata["split_indices"],
             "split_seed": target_data_metadata["split_seed"],

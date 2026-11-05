@@ -6,7 +6,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from dataloader import NHPDataset, denormalize_velocity, get_nhp_dataloaders
-from vae import SequentialVAE, poisson_nll_loss, kl_divergence_loss, trajectory_smoothness_loss
+from vae import SequentialVAE, poisson_nll_loss, kl_divergence_loss, trajectory_smoothness_loss, sample_latent_posterior
 from diffusion import LatentDiffusionModel, VPSDEScheduler, dsm_loss
 from decoder_models import compute_r2_score, compute_rmse
 
@@ -80,7 +80,14 @@ def train_epoch_phase1(
         # -------------------------------------------------------------
         dm_optimizer.zero_grad()
 
-        z_0 = mu.detach()
+        # Algorithm 1 infers a fresh posterior sample after the VAE update.
+        # Match Phase 2's frozen encoder/dropout mode while retaining q(z|x)
+        # variance; eval mode alone would otherwise return only the mean.
+        with torch.no_grad():
+            vae.encoder.eval()
+            mu_density, logvar_density = vae.encoder(spikes)
+            z_0 = sample_latent_posterior(mu_density, logvar_density)
+            vae.encoder.train()
         loss_dm = dsm_loss(diffusion_model, scheduler, z_0)
         loss_dm.backward()
         torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), max_norm=1.0)
@@ -168,6 +175,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-3, help="L2 weight decay regularization")
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
     parser.add_argument("--augment_mult", type=int, default=5, help="Data augmentation replication factor")
+    parser.add_argument("--spike_noise_factor", type=float, default=0.0,
+                        help="Optional extra spike-noise variant; zero keeps only posterior/diffusion noise")
     parser.add_argument("--kl_weight", type=float, default=0.05, help="ELBO KL loss weight")
     parser.add_argument("--behavior_weight", type=float, default=2.0, help="Velocity MSE loss weight")
     parser.add_argument("--inspect_data_only", action="store_true", help="Report source trial and velocity-window diagnostics without training")
@@ -186,6 +195,7 @@ def main():
         seq_len=args.seq_len,
         augment_multiplier=args.augment_mult,
         split_seed=args.split_seed,
+        train_noise_factor=args.spike_noise_factor,
     )
     print(
         f"Loaded source domain with {n_neurons} neurons across trials of "
@@ -311,6 +321,14 @@ def main():
                     "split_indices": velocity_stats["split_indices"],
                     "split_seed": velocity_stats["split_seed"],
                     "preprocessing": velocity_stats["preprocessing"],
+                    "diffusion_training": {
+                        "latent_distribution": "posterior_sample",
+                        "beta_min": scheduler.beta_min,
+                        "beta_max": scheduler.beta_max,
+                        "T": scheduler.T,
+                        "t_min": scheduler.t_min,
+                        "spike_noise_factor": args.spike_noise_factor,
+                    },
                 },
                 save_path,
             )

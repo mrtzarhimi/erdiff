@@ -3,6 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def sample_latent_posterior(mu: torch.Tensor, logvar: torch.Tensor, noise=None):
+    """Draw q(z|x) independently of dropout/training mode."""
+    if noise is None:
+        noise = torch.randn_like(mu)
+    return mu + torch.exp(0.5 * logvar) * noise
+
+
 class SequentialVAEEncoder(nn.Module):
     def __init__(
         self,
@@ -48,9 +55,7 @@ class SequentialVAEEncoder(nn.Module):
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         if not self.training:
             return mu
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        return sample_latent_posterior(mu, logvar)
 
 
 class SequentialVAEDecoder(nn.Module):
