@@ -1,6 +1,6 @@
 # ERDiff reproduction audit (Phase 1)
 
-Status: audit complete and approved fixes implemented in the working tree. Project code, tests, training, and numerical experiments were not run, following the user's no-execution instruction. Runtime correctness is therefore not verified.
+Status: the initial leakage-safe evaluation changes are committed. The paper-fidelity and alignment-regression investigation is in progress; no performance cause has been measured. Project code, tests, training, and numerical experiments have not been run, following the user's no-execution instruction. Runtime correctness is therefore not verified.
 
 ## Scope and provenance
 
@@ -8,6 +8,8 @@ Status: audit complete and approved fixes implemented in the working tree. Proje
 - Local working tree was clean at inspection. Local `HEAD`: `dd59baf9b0981b18b9d2891e5c31771daf3eb32b` (2026-10-26, commit subject `fear`).
 - Entry points: `train_phase1.py` (source training), `train_phase2.py` (target alignment), `evaluate.py` (single target inference), `evaluate_cross_day.py` (cross-day inference), and `cross_day.py` (benchmark orchestration). `regressor.py` and `decoder_models.py` are utility/model alternatives; the active training scripts import the in-file ridge behavior head from `vae.py` and metrics from `decoder_models.py`.
 - Repository instructions: no `AGENTS.md` or README instructions beyond `readme.md` were found in the visible project file list. README structure is stale: it names `eval.py` and says time-binning occurs, whereas actual files include `evaluate.py` and consume a `spike_counts` array without binning it here.
+
+**Version scope note:** findings A1–A13 below were written against local baseline `dd59baf` and a later official repository code snapshot, not solely against the 2023 author commit. They must not be read as a unified 2023 reproduction checklist. Follow-up findings R1–R8 explicitly pin the 2023 author implementation at `ae49f74e7fee70a2e3ea8205bf54d937ec552103` and separate it from the paper and later releases. For new reproduction decisions, use the pinned paper-era evidence and record later-code comparisons as a separate variant.
 
 ### Verified research sources
 
