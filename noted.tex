@@ -242,6 +242,55 @@ to appear in the published ERDiff objective. Source self-checks identify a
 failure mode; they do not establish a research contribution or paper-level
 performance reproduction.
 
+\subsection{Source-calibrated gradient scaling}
+
+Optional gradient diagnostics measure each loss component with respect to the
+target read-in parameters. For component $k$, the report records
+$\|\nabla_\theta \mathcal L_k\|_2$, the norm after its current scalar
+coefficient, and pairwise gradient cosines. These measurements use
+\texttt{autograd.grad}; they do not populate parameter gradients or change the
+optimizer state. Loss magnitudes alone do not determine which term dominates
+an update.
+
+The optional \texttt{source\_calibrated} mode estimates a single OT scale on
+fixed, clean source-training probes. It makes an independent copy of the
+source VAE/read-in, keeps the denoiser frozen, and uses locally seeded
+posterior draws, diffusion noise, and time values. No target behavior labels
+enter the calibration. For source probe $k$, define the coefficient-weighted
+gradient magnitudes
+\begin{equation}
+ G_{\rm MLA}=\sqrt{\frac{1}{K}\sum_{k=1}^{K}
+       \left((1-\alpha)\|\nabla_\theta(\mathcal L_{{\rm MLA},k}
+                                  +\lambda_v\mathcal V_k)\|_2\right)^2},
+ \qquad
+ G_{\rm OT}=\sqrt{\frac{1}{K}\sum_{k=1}^{K}
+       \left(\alpha\|\nabla_\theta\mathcal L_{{\rm OT},k}\|_2\right)^2}.
+\end{equation}
+When both RMS values are finite and exceed $10^{-12}$ in the calibration
+dtype, the stored factors are
+\begin{equation}
+ c_{\rm MLA}=1,\qquad
+ c_{\rm OT}=\operatorname{clip}\!\left(\frac{G_{\rm MLA}}{G_{\rm OT}},
+                                      0.01,100\right).
+\end{equation}
+The calibrated objective is
+\begin{equation}
+ \mathcal L=(1-\alpha)(\mathcal L_{\rm MLA}+\lambda_v\mathcal V)
+       +\alpha c_{\rm OT}\mathcal L_{\rm OT}
+       +\lambda_{\rm smooth}\mathcal L_{\rm smooth}.
+\end{equation}
+The variance term participates only inside the MLA branch when its configured
+weight is active; it is not scaled separately by $c_{\rm OT}$. An inactive
+variance gradient does not produce an independent scale. Calibration is
+marked invalid if either weighted component has
+an effectively zero or non-finite RMS gradient; the code does not substitute a
+factor in that case. A JSON artifact binds the exact factor to the source
+checkpoint/data hashes, probe trial IDs, diffusion schedule, transport
+settings, and fixed-fixture identity so the same factor can be reused across
+target sessions. This scaling is an experimental optimization variant. It
+changes relative step magnitudes, cannot correct opposed gradient directions
+or semantic ambiguity, and does not establish improved decoding.
+
 \section{Implementation and controlled comparison}
 
 \begin{tabularx}{\linewidth}{@{}lX@{}}

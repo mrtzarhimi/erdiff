@@ -97,13 +97,13 @@
 
 **Interfaces:** `component_gradient_report(losses: dict, params: tuple) -> dict` returns raw/weighted norms and pairwise cosines without accumulating `.grad`; `calibrate_source_gradient_scale(...) -> dict` returns immutable c_M=1 and bounded c_O from fixed source training probes, or explicit invalid status.
 
-- [ ] Write checks with analytic aligned/opposed/zero gradients, no parameter/optimizer/RNG mutation, inactive source variance penalty, and exact reuse of saved calibration factors.
-- [ ] Add `--log_component_gradients` and `--gradient_balance none|source_calibrated` (none). Log effective coefficients and cosine signs; do not infer gradient dominance from scalar loss values.
-- [ ] Calibrate on an independent source model/read-in copy with frozen denoiser and source-only fixed fixtures. Set c_O=clip(G_M/G_O, 0.01, 100), using RMS norms over probes; declare calibration invalid for nonfinite or effectively zero norms (threshold 1e-12 in the stored calibration dtype). Do not amplify an inactive variance gradient.
-- [ ] Apply `(1-alpha)*(MLA + lambda*V) + alpha*c_O*OT`; preserve the current objective exactly when balance=none. Reuse source factors across target sessions; never fit them against target behavior or choose them to improve a target R².
-- [ ] Save calibration sample IDs, schedule, noise-bank identity, raw norms and effective factors. Note that scaling is a variant and cannot correct opposed directions or semantic ambiguity by itself.
-- [ ] When authorized: `pytest tests/test_alignment_gradient_diagnostics.py -q`; expected tests pass. Otherwise mark unrun.
-- [ ] Commit: `feat: diagnose and optionally calibrate Phase 2 loss gradients`.
+- [x] Write checks with analytic aligned/opposed/zero gradients, no parameter/optimizer/RNG mutation, inactive source variance penalty, and exact reuse of saved calibration factors. Tests are present but unrun.
+- [x] Add `--log_component_gradients` and `--gradient_balance none|source_calibrated` (none). Log effective coefficients and cosine signs; do not infer gradient dominance from scalar loss values.
+- [x] Calibrate on an independent source model/read-in copy with frozen denoiser and source-only fixed fixtures. Set c_O=clip(G_M/G_O, 0.01, 100), using weighted RMS norms over probes; declare calibration invalid for nonfinite or effectively zero norms (threshold 1e-12 in the stored calibration dtype). Do not amplify an inactive variance gradient.
+- [x] Apply `(1-alpha)*(MLA + lambda*V) + alpha*c_O*OT`; preserve the current objective exactly when balance=none. Reuse source factors through the calibration artifact; calibration never uses target behavior or target R².
+- [x] Save calibration sample IDs, schedule, independent fixed-fixture identity, raw norms and effective factors. Document that scaling is a variant and cannot correct opposed directions or semantic ambiguity by itself.
+- [ ] When authorized: execute `pytest tests/test_alignment_gradient_diagnostics.py -q`. Not run under the standing no-execution instruction.
+- [x] Commit: `feat: diagnose and optionally calibrate Phase 2 loss gradients`.
 
 ### Task 6: Expose individual and combined controlled runs
 

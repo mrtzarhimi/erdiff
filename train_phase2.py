@@ -1,4 +1,6 @@
 import argparse
+import copy
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -14,7 +16,12 @@ from checkpoint_provenance import code_revision, file_fingerprint, file_sha256
 from phase2_freeze_guard import FrozenDiffusionGuard
 from alignment_noise_bank import AlignmentNoiseBank
 from neuron_input_mapping import NeuronInputMap
-from alignment_gradient_diagnostics import component_gradient_report, calibrate_source_gradient_scale
+from alignment_gradient_diagnostics import (
+    component_gradient_report,
+    calibrate_source_gradient_scale,
+    load_gradient_calibration,
+    save_gradient_calibration,
+)
 from diffusion import (
     LatentDiffusionModel,
     VPSDEScheduler,
@@ -90,6 +97,100 @@ def extract_source_latent_bank(vae: SequentialVAE, source_loader, device: torch.
         logvar=torch.cat(source_logvars, dim=0),
         trial_ids=torch.cat(source_trial_ids),
     )
+
+
+def build_source_gradient_calibration(
+    vae, diffusion_model, scheduler, source_loader, source_latents_bank, device,
+    *, alpha, ot_epsilon, sinkhorn_iters, probe_batches, seed, provenance,
+    mla_variance_weight=0.0, mla_variance_floor=0.9, mla_variance_scope="batch",
+):
+    """Measure fixed source-only loss gradients through an independent read-in copy."""
+    if probe_batches < 1:
+        raise ValueError("Gradient calibration needs at least one source probe batch.")
+    probe_model = copy.deepcopy(vae)
+    probe_model.freeze_for_alignment()
+    probe_model.eval()
+    probe_model.encoder.rnn.train()
+    parameters = tuple(probe_model.encoder.read_in.parameters())
+
+    bank_index = {int(trial_id): index for index, trial_id in
+                  enumerate(source_latents_bank.trial_ids.tolist())}
+    generators = {
+        name: torch.Generator(device="cpu").manual_seed(int(seed) + offset)
+        for offset, name in enumerate(("target_eta", "source_eta", "time", "diffusion_eps"), start=101)
+    }
+    probes, sample_ids = [], []
+    source_variance = None
+    source_variance_pool = None
+    if mla_variance_weight > 0:
+        from mla_stabilization import source_trial_variance
+        source_variance = source_trial_variance(source_latents_bank.mu)
+        if mla_variance_scope == "full_train":
+            source_variance_pool = source_loader.dataset.spikes.to(device)
+    diffusion_model.eval()
+    for batch_index, batch in enumerate(source_loader):
+        if batch_index >= probe_batches:
+            break
+        spikes = batch["spikes"].to(device)
+        trial_ids = batch["trial_id"].cpu().long()
+        indices_cpu = torch.tensor([bank_index[int(i)] for i in trial_ids.tolist()], dtype=torch.long)
+        indices = indices_cpu.to(source_latents_bank.mu.device)
+
+        mu, logvar = probe_model.encoder(spikes)
+        posterior_eta = torch.randn(
+            mu.shape, generator=generators["target_eta"], dtype=mu.dtype, device="cpu"
+        ).to(device)
+        z_target = sample_latent_posterior(mu, logvar, posterior_eta)
+
+        source_mu = source_latents_bank.mu[indices]
+        source_logvar = source_latents_bank.logvar[indices]
+        source_eta = torch.randn(
+            source_mu.shape, generator=generators["source_eta"], dtype=source_mu.dtype, device="cpu"
+        ).to(source_mu.device)
+        z_source = sample_latent_posterior(source_mu, source_logvar, source_eta).detach()
+
+        times_cpu = torch.rand(
+            (len(trial_ids),), generator=generators["time"], dtype=mu.dtype
+        )
+        times = (scheduler.t_min + times_cpu * (scheduler.T - scheduler.t_min)).to(device)
+        diffusion_eps = torch.randn(
+            mu.shape, generator=generators["diffusion_eps"], dtype=mu.dtype, device="cpu"
+        ).to(device)
+        _, loss_mla, loss_ot = total_alignment_loss(
+            diffusion_model=diffusion_model,
+            scheduler=scheduler,
+            z_target=z_target,
+            z_source=z_source,
+            alpha=alpha,
+            ot_epsilon=ot_epsilon,
+            sinkhorn_iters=sinkhorn_iters,
+            return_components=True,
+            mla_noise=diffusion_eps,
+            mla_timesteps=times,
+        )
+        probe = {"mla": loss_mla, "ot": loss_ot}
+        if mla_variance_weight > 0:
+            from mla_stabilization import encoder_pool_variance_loss, source_variance_floor_loss
+            if mla_variance_scope == "full_train":
+                variance_loss = encoder_pool_variance_loss(
+                    probe_model.encoder, source_variance_pool, source_variance, mla_variance_floor
+                )
+            else:
+                variance_loss = source_variance_floor_loss(mu, source_variance, mla_variance_floor)
+            probe["variance"] = variance_loss
+        probes.append(probe)
+        sample_ids.extend(trial_ids.tolist())
+
+    if not probes:
+        raise ValueError("No source trials were available for gradient calibration.")
+    result = calibrate_source_gradient_scale(
+        probes, parameters, alpha=alpha, mla_variance_weight=mla_variance_weight,
+        metadata={**provenance, "sample_ids": sample_ids,
+                  "probe_batches": len(probes), "calibration_dtype": str(parameters[0].dtype)},
+    )
+    result["provenance"] = {**provenance, "sample_ids": sample_ids}
+    del probe_model
+    return result
 
 
 @torch.no_grad()
@@ -180,6 +281,10 @@ def train_epoch_phase2(
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
     """
+    if gradient_balance not in ("none", "source_calibrated"):
+        raise ValueError(f"Unknown gradient balance mode: {gradient_balance}")
+    if not torch.isfinite(torch.tensor(float(ot_scale))) or ot_scale <= 0:
+        raise ValueError("OT gradient scale must be finite and positive.")
     vae.eval()                    # Disable dropout in encoder/decoder
     vae.encoder.rnn.train()       # Required by cuDNN to backprop through frozen GRU into read_in
     diffusion_model.eval()        # Frozen score network
@@ -195,6 +300,10 @@ def train_epoch_phase2(
     sample_exposures = 0
     full_variance_forwards = 0
     full_variance_sample_exposures = 0
+    component_gradient_totals = {}
+    component_cosine_totals = {}
+    component_cosine_counts = {}
+    component_gradient_batches = 0
     source_mu = source_latents_bank.mu
     source_logvar = source_latents_bank.logvar
     source_trial_ids = source_latents_bank.trial_ids
@@ -256,10 +365,8 @@ def train_epoch_phase2(
             mla_timesteps=mla_times,
         )
         loss = (1.0 - alpha) * loss_mla + alpha * ot_scale * loss_ot
-        if log_component_gradients:
-            component_gradient_report({"mla": loss_mla, "ot": loss_ot},
-                                      tuple(vae.encoder.read_in.parameters()),
-                                      {"mla": 1.0 - alpha, "ot": alpha * ot_scale})
+        gradient_losses = {"mla": loss_mla, "ot": loss_ot}
+        gradient_coefficients = {"mla": 1.0 - alpha, "ot": alpha * ot_scale}
         variance_value = 0.0
         variance_contribution = 0.0
         if mla_variance_weight > 0 and alpha < 1.0:
@@ -281,6 +388,8 @@ def train_epoch_phase2(
                 raise ValueError(f"Unknown variance scope: {mla_variance_scope}")
             weighted_variance = (1.0 - alpha) * mla_variance_weight * loss_variance
             loss = loss + weighted_variance
+            gradient_losses["variance"] = loss_variance
+            gradient_coefficients["variance"] = (1.0 - alpha) * mla_variance_weight
             variance_value = loss_variance.item()
             variance_contribution = weighted_variance.item()
         smooth_value = 0.0
@@ -288,6 +397,23 @@ def train_epoch_phase2(
             loss_smooth = trajectory_smoothness_loss(mu_t)
             smooth_value = loss_smooth.item()
             loss = loss + smooth_weight * loss_smooth
+            gradient_losses["smooth"] = loss_smooth
+            gradient_coefficients["smooth"] = smooth_weight
+
+        if log_component_gradients:
+            report = component_gradient_report(
+                gradient_losses, tuple(vae.encoder.read_in.parameters()), gradient_coefficients
+            )
+            for name, values in report["components"].items():
+                totals = component_gradient_totals.setdefault(name, {"norm": 0.0, "weighted_norm": 0.0})
+                if values["norm"] is not None:
+                    totals["norm"] += values["norm"]
+                    totals["weighted_norm"] += values["weighted_norm"]
+            for name, value in report["cosines"].items():
+                if value is not None:
+                    component_cosine_totals[name] = component_cosine_totals.get(name, 0.0) + value
+                    component_cosine_counts[name] = component_cosine_counts.get(name, 0) + 1
+            component_gradient_batches += 1
 
         # 4. Update ONLY encoder.read_in
         loss.backward()
@@ -304,6 +430,18 @@ def train_epoch_phase2(
         clipped_steps += int(grad_norm.item() > 1.0)
 
     batches = len(target_loader)
+    component_gradient_summary = None
+    if component_gradient_batches:
+        component_gradient_summary = {
+            "components": {
+                name: {key: value / component_gradient_batches for key, value in totals.items()}
+                for name, totals in component_gradient_totals.items()
+            },
+            "cosines": {
+                name: value / component_cosine_counts[name]
+                for name, value in component_cosine_totals.items()
+            },
+        }
     return {
         "total": total_loss / batches,
         "mla": total_mla / batches,
@@ -317,6 +455,7 @@ def train_epoch_phase2(
         "sample_exposures": sample_exposures,
         "full_variance_forwards": full_variance_forwards,
         "full_variance_sample_exposures": full_variance_sample_exposures,
+        "component_gradient_report": component_gradient_summary,
     }
 
 
@@ -346,6 +485,14 @@ def main():
     parser.add_argument("--noise_bank_path", type=str, default=None,
                         help="Optional saved bank path; fixed_bank loads/reuses it or creates it there")
     parser.add_argument("--log_component_gradients", action="store_true")
+    parser.add_argument("--gradient_balance", choices=("none", "source_calibrated"), default="none",
+                        help="Optionally scale the OT gradient using fixed source-training probes")
+    parser.add_argument("--gradient_calibration_path", default=None,
+                        help="Reusable source-only calibration JSON; defaults inside save_dir")
+    parser.add_argument("--gradient_calibration_batches", type=int, default=3,
+                        help="Number of fixed clean source-training batches used for calibration")
+    parser.add_argument("--gradient_calibration_seed", type=int, default=42,
+                        help="Seed for independent fixed source-only calibration fixtures")
     parser.add_argument("--augment_mult", type=int, default=3, help="Target data repetition when --augment_target is enabled")
     parser.add_argument("--augment_target", action="store_true", help="Experimental variant: augment target adaptation spikes")
     parser.add_argument("--readin_init", choices=("source_or_random", "ridge", "random"), default="source_or_random",
@@ -399,6 +546,12 @@ def main():
         raise ValueError("MLA variance weight must be finite and nonnegative.")
     if not math.isfinite(args.mla_variance_floor) or not 0 < args.mla_variance_floor <= 1:
         raise ValueError("MLA variance floor must lie in (0, 1].")
+    if args.gradient_calibration_batches < 1:
+        raise ValueError("Gradient calibration batch count must be positive.")
+    if not 0.0 <= args.alpha <= 1.0:
+        raise ValueError("alpha must lie in [0, 1].")
+    if args.gradient_balance == "source_calibrated" and args.alpha in (0.0, 1.0):
+        raise ValueError("Source gradient balancing requires both MLA and OT to be active (0 < alpha < 1).")
     if args.noise_bank_replicates < 1:
         raise ValueError("Noise bank replicate count must be positive.")
 
@@ -531,7 +684,7 @@ def main():
         "noise_seed": args.noise_seed,
         "noise_bank_replicates": args.noise_bank_replicates,
         "log_component_gradients": args.log_component_gradients,
-        "gradient_balance": "none",
+        "gradient_balance": args.gradient_balance,
         "frozen_check": args.frozen_check,
         "source_self_check": args.source_self_check,
         "optimizer": "Adam",
@@ -546,6 +699,9 @@ def main():
         "diffusion_T": noise_config["T"],
         "diffusion_t_min": noise_config["t_min"],
     }
+    if args.gradient_balance == "source_calibrated":
+        runtime_config["gradient_calibration_batches"] = args.gradient_calibration_batches
+        runtime_config["gradient_calibration_seed"] = args.gradient_calibration_seed
     source_data_fingerprint = checkpoint.get("source_data_fingerprint")
     if source_data_fingerprint is not None:
         from checkpoint_provenance import verify_data_fingerprint
@@ -578,6 +734,7 @@ def main():
         behavior_dim=2,
     ).to(device)
     vae.load_state_dict(checkpoint["vae_state_dict"])
+    source_vae_for_calibration = copy.deepcopy(vae) if args.gradient_balance == "source_calibrated" else None
 
     diffusion_model = LatentDiffusionModel(
         seq_len=args.seq_len,
@@ -597,6 +754,10 @@ def main():
     # 3. Precompute Source Latent Bank
     print("Pre-computing source domain latent bank...")
     source_latents_bank = extract_source_latent_bank(vae, clean_source_loader, device)
+    scheduler = VPSDEScheduler(
+        beta_min=noise_config["beta_min"], beta_max=noise_config["beta_max"],
+        T=noise_config["T"], t_min=noise_config["t_min"],
+    )
     noise_bank_path = args.noise_bank_path or os.path.join(args.save_dir, "alignment_noise_bank.pt")
     noise_bank = None
     source_noise_domain = f"source:{source_fingerprint}"
@@ -615,6 +776,75 @@ def main():
             target_noise_domain, optimization_dataset.trial_ids, args.seq_len, latent_dim
         )
     source_rng = source_sampling_generator(args.seed)
+    gradient_calibration = None
+    ot_scale = 1.0
+    gradient_calibration_path = args.gradient_calibration_path or os.path.join(
+        args.save_dir, "source_gradient_calibration.json"
+    )
+    if args.gradient_balance == "source_calibrated":
+        sample_count = min(len(clean_source_loader.dataset),
+                           args.gradient_calibration_batches * args.batch_size)
+        sample_ids = clean_source_loader.dataset.trial_ids[:sample_count].tolist()
+        fixture_recipe = {
+            "source_checkpoint_sha256": source_fingerprint,
+            "source_data_sha256": data_fingerprints["source"]["sha256"],
+            "sample_ids": sample_ids,
+            "seed": args.gradient_calibration_seed,
+            "schedule": {key: noise_config[key] for key in ("beta_min", "beta_max", "T", "t_min")},
+            "alpha": args.alpha,
+            "ot_epsilon": args.ot_epsilon,
+            "sinkhorn_iters": args.sinkhorn_iters,
+            "mla_variance_weight": args.mla_variance_weight,
+            "mla_variance_floor": args.mla_variance_floor,
+            "mla_variance_scope": args.mla_variance_scope,
+            "batch_size": args.batch_size,
+            "streams": ["target_eta", "source_eta", "time", "diffusion_eps"],
+        }
+        fixture_id = hashlib.sha256(
+            json.dumps(fixture_recipe, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        calibration_provenance = {
+            "source_checkpoint_sha256": source_fingerprint,
+            "source_data_sha256": data_fingerprints["source"]["sha256"],
+            "alpha": args.alpha,
+            "ot_epsilon": args.ot_epsilon,
+            "sinkhorn_iters": args.sinkhorn_iters,
+            "diffusion_schedule": fixture_recipe["schedule"],
+            "sample_ids": sample_ids,
+            "noise_bank_identity": f"independent_fixed_source_fixture:{fixture_id}",
+            "calibration_seed": args.gradient_calibration_seed,
+            "probe_batches": args.gradient_calibration_batches,
+            "batch_size": args.batch_size,
+            "fixture_streams": fixture_recipe["streams"],
+            "mla_variance_weight": args.mla_variance_weight,
+            "mla_variance_floor": args.mla_variance_floor,
+            "mla_variance_scope": args.mla_variance_scope,
+        }
+        if os.path.isfile(gradient_calibration_path):
+            gradient_calibration = load_gradient_calibration(
+                gradient_calibration_path, calibration_provenance
+            )
+        else:
+            gradient_calibration = build_source_gradient_calibration(
+                source_vae_for_calibration, diffusion_model, scheduler, clean_source_loader,
+                source_latents_bank, device, alpha=args.alpha, ot_epsilon=args.ot_epsilon,
+                sinkhorn_iters=args.sinkhorn_iters, probe_batches=args.gradient_calibration_batches,
+                seed=args.gradient_calibration_seed, provenance=calibration_provenance,
+                mla_variance_weight=args.mla_variance_weight,
+                mla_variance_floor=args.mla_variance_floor,
+                mla_variance_scope=args.mla_variance_scope,
+            )
+            save_gradient_calibration(gradient_calibration_path, gradient_calibration)
+            if not gradient_calibration["valid"]:
+                raise ValueError(
+                    "Source-only gradient calibration is invalid: "
+                    f"{gradient_calibration.get('reason')}"
+                )
+        ot_scale = float(gradient_calibration["c_ot"])
+        print(
+            f"Source-calibrated gradient factors: c_MLA={gradient_calibration['c_mla']:.6g} | "
+            f"c_OT={ot_scale:.6g} | source-only probes={len(gradient_calibration['provenance']['sample_ids'])}"
+        )
     source_variance = None
     variance_pool_spikes = None
 
@@ -667,10 +897,6 @@ def main():
         (alignment_optimizer,), failure_path=freeze_failure_path,
         context={"stage": "before_phase2_optimization", "target_session": os.path.realpath(args.target_data_path)},
     )
-    scheduler = VPSDEScheduler(
-        beta_min=noise_config["beta_min"], beta_max=noise_config["beta_max"],
-        T=noise_config["T"], t_min=noise_config["t_min"],
-    )
     # Validate sampling controls without drawing noise or changing RNG state.
     if args.mla_fixed_t is not None:
         import math
@@ -701,6 +927,7 @@ def main():
 
     save_path = os.path.join(args.save_dir, "phase2_aligned_target_model.pt")
     diagnostics = None
+    component_gradient_history = []
     if args.mla_diagnostics:
         import math
         from mla_diagnostics import MLADiagnostics
@@ -750,6 +977,8 @@ def main():
             variance_pool_spikes=variance_pool_spikes,
             noise_bank=noise_bank,
             noise_replicate=(epoch - 1) % args.noise_bank_replicates,
+            gradient_balance=args.gradient_balance,
+            ot_scale=ot_scale,
             log_component_gradients=args.log_component_gradients,
             source_sampling_rng=source_rng,
             target_noise_domain=target_noise_domain,
@@ -766,6 +995,11 @@ def main():
         sample_exposures += align_metrics["sample_exposures"]
         full_variance_forwards += align_metrics["full_variance_forwards"]
         full_variance_sample_exposures += align_metrics["full_variance_sample_exposures"]
+        if args.log_component_gradients:
+            component_gradient_history.append({
+                "epoch": epoch, "components": align_metrics["component_gradient_report"]["components"],
+                "cosines": align_metrics["component_gradient_report"]["cosines"],
+            })
 
         if epoch % 10 == 0 or epoch == args.epochs:
             print(
@@ -775,9 +1009,20 @@ def main():
                 f"Smooth: {align_metrics['smooth']:.4f} | "
                 f"Var floor: {align_metrics['variance_floor']:.4f} "
                 f"(weighted {align_metrics['variance_contribution']:.4f}) | "
+                f"effective coefficients: MLA={1.0 - args.alpha:.4g}, "
+                f"OT={args.alpha * ot_scale:.4g} | "
                 f"Read-in grad: {align_metrics['grad_norm']:.4f} | "
                 f"Clipped: {align_metrics['clipped_steps']}/{align_metrics['updates']}"
             )
+            if args.log_component_gradients and align_metrics["component_gradient_report"] is not None:
+                components = align_metrics["component_gradient_report"]["components"]
+                pairs = align_metrics["component_gradient_report"]["cosines"]
+                component_text = ", ".join(
+                    f"{name}={values['norm']:.4g}/{values['weighted_norm']:.4g}"
+                    for name, values in components.items()
+                )
+                cosine_text = ", ".join(f"{name}={value:+.3f}" for name, value in pairs.items())
+                print(f"  Component gradient norms raw/weighted: {component_text}; cosines: {cosine_text}")
             if args.source_self_check:
                 source_r2, source_rmse = evaluate_phase1(vae, src_validation_loader, device)
                 source_self_history.append({"epoch": epoch, "r2": source_r2, "normalized_rmse": source_rmse})
@@ -870,6 +1115,17 @@ def main():
         os.path.realpath(noise_bank_path) if noise_bank is not None else None
     )
     manifest["alignment_noise_bank_sha256"] = noise_bank_hash
+    manifest["gradient_balance"] = args.gradient_balance
+    manifest["gradient_calibration_path"] = (
+        os.path.realpath(gradient_calibration_path)
+        if gradient_calibration is not None else None
+    )
+    manifest["gradient_calibration"] = gradient_calibration
+    manifest["gradient_calibration_factor"] = ot_scale
+    manifest["gradient_calibration_variant_note"] = (
+        "source-only gradient scaling changes the optimization variant and cannot repair opposed gradients"
+        if args.gradient_balance == "source_calibrated" else None
+    )
     manifest["finite_bank_is_training_variant"] = noise_bank is not None
     manifest["probe_noise_namespace"] = "independent_mla_diagnostics_fixture"
     manifest["exact_reproduction_claimable"] = exact_reproduction_claimable(manifest)
@@ -890,6 +1146,11 @@ def main():
             "alignment_epochs": args.epochs,
             "diffusion_frozen_verified": True,
             "source_trial_variance": None if source_variance is None else source_variance.cpu(),
+            "gradient_balance": args.gradient_balance,
+            "gradient_calibration": gradient_calibration,
+            "gradient_calibration_path": manifest["gradient_calibration_path"],
+            "gradient_calibration_factor": ot_scale,
+            "component_gradient_history": component_gradient_history,
             "variance_pool_trials": len(clean_target_loader.dataset),
             "source_checkpoint_sha256": source_fingerprint,
             "source_checkpoint_path": os.path.realpath(args.source_checkpoint),
@@ -943,7 +1204,11 @@ def main():
                 "noise_seed": args.noise_seed,
                 "noise_bank_replicates": args.noise_bank_replicates,
                 "log_component_gradients": args.log_component_gradients,
-                "gradient_balance": "none",
+                "gradient_balance": args.gradient_balance,
+                "gradient_calibration_batches": args.gradient_calibration_batches,
+                "gradient_calibration_seed": args.gradient_calibration_seed,
+                "gradient_calibration_path": manifest["gradient_calibration_path"],
+                "gradient_calibration_factor": ot_scale,
             },
         },
         save_path,
