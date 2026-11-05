@@ -75,7 +75,7 @@ def plot_cross_day_drift(df: pd.DataFrame, save_path: str):
         linestyle="--",
         color="gray",
         linewidth=2,
-        label="Unaligned (Direct Transfer)",
+        label="Pre-alignment warm start",
     )
     plt.plot(
         df["days_elapsed"],
@@ -216,6 +216,9 @@ def main():
 
         summary_records.append({
             "target_session": target_file,
+            "seed": args.seed,
+            "test_trials": int(res.get("Test trials", 0)),
+            "alignment_epochs": int(res.get("Alignment epochs", 0)),
             "days_elapsed": days_elapsed,
             "unaligned_r2": round(unaligned_r2, 2),
             "aligned_r2": round(aligned_r2, 2),

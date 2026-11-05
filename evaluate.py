@@ -198,7 +198,8 @@ def main():
     # -------------------------------------------------------------
     # 3. Unaligned Target Evaluation (Random/Zero initialization of read-in)
     # -------------------------------------------------------------
-    # 3. Unaligned Target Evaluation (Direct Transfer Baseline)
+    # 3. Pre-alignment warm-start baseline. The initial read-in may use target
+    # training spikes when neuron counts differ, so this is not raw direct transfer.
     if "unaligned_read_in_state" in aligned_ckpt:
         vae.encoder.read_in.load_state_dict(aligned_ckpt["unaligned_read_in_state"])
     unaligned_latents, unaligned_pred_v, true_v, targets = run_inference(vae, target_test_loader, device)
@@ -242,13 +243,16 @@ def main():
     print(f"Target Neurons      : {n_tgt_neurons}")
     print(f"Latent Dimension    : {latent_dim}")
     print("-" * 50)
-    print(f"Unaligned Performance: R^2 = {r2_unaligned:6.2f}% | RMSE = {rmse_unaligned:.4f}")
+    print(f"Pre-alignment warm start: R^2 = {r2_unaligned:6.2f}% | RMSE = {rmse_unaligned:.4f}")
     print(f"ERDiff Aligned       : R^2 = {r2_aligned:6.2f}% | RMSE = {rmse_aligned:.4f}")
     print(f"Absolute Gain        : ΔR^2 = {r2_aligned - r2_unaligned:+6.2f}% | ΔRMSE = {rmse_aligned - rmse_unaligned:+6.4f}")
     print("=" * 50)
 
     # Save metrics to text file
     with open(os.path.join(args.output_dir, "metrics.txt"), "w") as f:
+        f.write(f"Seed: {args.seed}\n")
+        f.write(f"Test trials: {len(target_test_loader.dataset)}\n")
+        f.write(f"Alignment epochs: {aligned_ckpt.get('alignment_epochs', -1)}\n")
         f.write(f"Unaligned R2: {r2_unaligned:.4f}\n")
         f.write(f"Unaligned RMSE: {rmse_unaligned:.4f}\n")
         f.write(f"Aligned R2: {r2_aligned:.4f}\n")
