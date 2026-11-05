@@ -192,8 +192,21 @@ class VPSDEScheduler:
         self.T = T
         self.t_min = t_min
 
-    def sample_timesteps(self, batch_size: int, device):
-        return torch.rand(batch_size, device=device) * (self.T - self.t_min) + self.t_min
+    def sample_timesteps(self, batch_size: int, device, time_min=None, time_max=None, fixed_time=None):
+        low = self.t_min if time_min is None else time_min
+        high = self.T if time_max is None else time_max
+        if not math.isfinite(low) or not math.isfinite(high) or not self.t_min <= low < high <= self.T:
+            raise ValueError("Noise-time bounds must stay within the source training interval.")
+        if fixed_time is not None:
+            if time_min is not None or time_max is not None:
+                raise ValueError("Choose a fixed MLA time or a time range, not both.")
+            if not math.isfinite(fixed_time) or not self.t_min <= fixed_time <= self.T:
+                raise ValueError("Fixed noise time must stay within the source training interval.")
+        # Consume the same RNG draws in every ablation, including fixed-time runs.
+        uniform = torch.rand(batch_size, device=device)
+        if fixed_time is not None:
+            return torch.full_like(uniform, fixed_time)
+        return uniform * (high - low) + low
 
     def marginal_params(self, t: torch.Tensor):
         # Integral of beta(s) from 0 to t
@@ -242,13 +255,16 @@ def mla_loss(
     diffusion_model: LatentDiffusionModel,
     scheduler: VPSDEScheduler,
     z_0_target: torch.Tensor,
+    time_min=None,
+    time_max=None,
+    fixed_time=None,
 ) -> torch.Tensor:
     """
     Phase 2: Maximum Likelihood Alignment (MLA) Loss (Equation 12 & Equation 26).
     The diffusion model is FROZEN. The gradient flows back through z_t into z_0_target (and the encoder).
     """
     batch_size = z_0_target.size(0)
-    t = scheduler.sample_timesteps(batch_size, z_0_target.device)
+    t = scheduler.sample_timesteps(batch_size, z_0_target.device, time_min, time_max, fixed_time)
     eps = torch.randn_like(z_0_target)
 
     return fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps)
@@ -314,6 +330,9 @@ def total_alignment_loss(
     ot_epsilon: float = 0.1,
     sinkhorn_iters: int = 100,
     return_components: bool = False,
+    mla_t_min=None,
+    mla_t_max=None,
+    mla_fixed_t=None,
 ) -> torch.Tensor:
     """
     Total Phase 2 Alignment Loss:
@@ -321,7 +340,7 @@ def total_alignment_loss(
     """
     if not 0.0 <= alpha <= 1.0:
         raise ValueError("alpha must be between 0 and 1 for the paper's loss mixture.")
-    loss_mla = mla_loss(diffusion_model, scheduler, z_target)
+    loss_mla = mla_loss(diffusion_model, scheduler, z_target, mla_t_min, mla_t_max, mla_fixed_t)
     loss_shd = sinkhorn_loss(z_source, z_target, epsilon=ot_epsilon, num_iters=sinkhorn_iters)
     total = (1.0 - alpha) * loss_mla + alpha * loss_shd
     if return_components:

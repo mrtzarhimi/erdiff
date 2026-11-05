@@ -127,6 +127,9 @@ def train_epoch_phase2(
     ot_epsilon: float = 0.1,
     sinkhorn_iters: int = 100,
     smooth_weight: float = 0.0,
+    mla_t_min=None,
+    mla_t_max=None,
+    mla_fixed_t=None,
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
@@ -168,6 +171,9 @@ def train_epoch_phase2(
             ot_epsilon=ot_epsilon,
             sinkhorn_iters=sinkhorn_iters,
             return_components=True,
+            mla_t_min=mla_t_min,
+            mla_t_max=mla_t_max,
+            mla_fixed_t=mla_fixed_t,
         )
         loss = loss_align
         smooth_value = 0.0
@@ -230,6 +236,9 @@ def main():
     parser.add_argument("--mla_probe_trials", type=int, default=16)
     parser.add_argument("--mla_probe_seed", type=int, default=42)
     parser.add_argument("--mla_diagnostic_every", type=int, default=10)
+    parser.add_argument("--mla_t_min", type=float, default=None, help="Diagnostic ablation: restrict MLA diffusion-time range")
+    parser.add_argument("--mla_t_max", type=float, default=None, help="Diagnostic ablation: restrict MLA diffusion-time range")
+    parser.add_argument("--mla_fixed_t", type=float, default=None, help="Diagnostic ablation: train MLA at one diffusion time")
     args = parser.parse_args()
 
     if args.mla_diagnostics_only:
@@ -356,6 +365,21 @@ def main():
         beta_min=noise_config["beta_min"], beta_max=noise_config["beta_max"],
         T=noise_config["T"], t_min=noise_config["t_min"],
     )
+    # Validate sampling controls without drawing noise or changing RNG state.
+    if args.mla_fixed_t is not None:
+        import math
+        if args.mla_t_min is not None or args.mla_t_max is not None:
+            raise ValueError("Choose --mla_fixed_t or a time range, not both.")
+        if not math.isfinite(args.mla_fixed_t) or not scheduler.t_min <= args.mla_fixed_t <= scheduler.T:
+            raise ValueError("Fixed MLA time must lie within the source training interval.")
+        print(f"MLA training noise: fixed t={args.mla_fixed_t:g}")
+    else:
+        import math
+        low = scheduler.t_min if args.mla_t_min is None else args.mla_t_min
+        high = scheduler.T if args.mla_t_max is None else args.mla_t_max
+        if not math.isfinite(low) or not math.isfinite(high) or not scheduler.t_min <= low < high <= scheduler.T:
+            raise ValueError("MLA time range must lie within the source training interval.")
+        print(f"MLA training noise: uniform t in [{low:g}, {high:g}]")
 
     # Save the initialization for a paired, pre-alignment target baseline.
     unaligned_read_in_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
@@ -377,6 +401,12 @@ def main():
         diagnostics = MLADiagnostics(
             clean_target_loader.dataset, checkpoint["split_indices"]["train"], latent_dim,
             args.mla_probe_times, args.mla_probe_seed, args.mla_probe_trials, args.save_dir,
+            context={
+                "source_checkpoint": os.path.realpath(args.source_checkpoint),
+                "source_epoch": checkpoint.get("epoch"), "seed": args.seed, "split_seed": args.split_seed,
+                "alpha": args.alpha, "mla_t_min": args.mla_t_min,
+                "mla_t_max": args.mla_t_max, "mla_fixed_t": args.mla_fixed_t,
+            },
         )
         diagnostics.record(0, vae, diffusion_model, scheduler, device, args.batch_size)
         if args.mla_diagnostics_only:
@@ -397,6 +427,9 @@ def main():
             ot_epsilon=args.ot_epsilon,
             sinkhorn_iters=args.sinkhorn_iters,
             smooth_weight=args.smooth_weight,
+            mla_t_min=args.mla_t_min,
+            mla_t_max=args.mla_t_max,
+            mla_fixed_t=args.mla_fixed_t,
         )
 
         if epoch % 10 == 0 or epoch == args.epochs:
@@ -437,6 +470,9 @@ def main():
                 "ot_epsilon": args.ot_epsilon,
                 "sinkhorn_iters": args.sinkhorn_iters,
                 "smooth_weight": args.smooth_weight,
+                "mla_t_min": args.mla_t_min,
+                "mla_t_max": args.mla_t_max,
+                "mla_fixed_t": args.mla_fixed_t,
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
                 "augment_mult": args.augment_mult,

@@ -47,7 +47,7 @@ def variance_summary(vae, spikes, device, batch_size):
 
 
 class MLADiagnostics:
-    def __init__(self, dataset, train_indices, latent_dim, times, seed, trial_count, save_dir):
+    def __init__(self, dataset, train_indices, latent_dim, times, seed, trial_count, save_dir, context=None):
         generator = torch.Generator().manual_seed(seed)
         count = min(trial_count, len(dataset.spikes))
         if count < 1:
@@ -59,6 +59,7 @@ class MLADiagnostics:
         self.posterior_noise = torch.randn(shape, generator=generator)
         self.diffusion_noise = torch.randn(shape, generator=generator)
         self.times = times
+        self.context = {} if context is None else context
         self.baseline = None
         self.path = os.path.join(save_dir, "mla_diagnostics.jsonl")
         with open(self.path, "w"):
@@ -70,10 +71,12 @@ class MLADiagnostics:
             "posterior_noise": self.posterior_noise,
             "diffusion_noise": self.diffusion_noise,
             "times": times,
+            "configuration": self.context,
         }, os.path.join(save_dir, "mla_probe_fixture.pt"))
 
     def record(self, epoch, vae, denoiser, scheduler, device, batch_size):
-        with probe_modes(vae, denoiser):
+        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+        with torch.random.fork_rng(devices=cuda_devices), probe_modes(vae, denoiser):
             summary = variance_summary(vae, self.all_spikes, device, batch_size)
             if self.baseline is None:
                 self.baseline = summary
@@ -82,7 +85,7 @@ class MLADiagnostics:
                 for key in ("mu_variance", "mu_trial_variance", "posterior_variance", "prediction_variance")
             }
             probes = [self.gradient_probe(t, vae, denoiser, scheduler, device) for t in self.times]
-        row = {"epoch": epoch, "variance": summary, "ratios": ratios, "probes": probes}
+        row = {"epoch": epoch, "configuration": self.context, "variance": summary, "ratios": ratios, "probes": probes}
         with open(self.path, "a") as handle:
             handle.write(json.dumps(row, allow_nan=False) + "\n")
         print(f"MLA variance epoch {epoch}: " + ", ".join(f"{name}={value:.4g}" for name, value in ratios.items()))

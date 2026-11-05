@@ -15,3 +15,11 @@ Interpretation: falling trial-to-trial mean and prediction variance supports col
 Diagnostic forwards disable dropout, preserve model modes on exit, avoid DataLoader iterator RNG draws, and use autograd.grad without accumulating parameter gradients. They use only source training spikes. Source validation R² is reported separately by the existing self-check and never selects a checkpoint.
 
 Execution status: code and focused side-effect/replay tests were written but not run. No dataset reads, model imports, training, or numerical experiments were executed during implementation. Existing uncommitted checkpoint provenance work is separate.
+
+## Source-only noising experiments
+
+`--mla_fixed_t` fixes the training corruption time; alternatively `--mla_t_min` and `--mla_t_max` restrict its uniform sampling interval. They change MLA sampling, not the frozen source diffusion schedule. Without these flags, the source training time interval is used. A fixed time still consumes the ordinary uniform-time RNG draw so subsequent posterior/diffusion draws follow the same stream for matched seeds. The independent diagnostic probes always use `--mla_probe_times`, regardless of the training-time policy. Times are not noise standard deviations: the artifact records the actual VP coefficients.
+
+First record probes with `--mla_diagnostics_only`. Then compare a 50-epoch MLA-only source self-check under the original uniform interval and fixed times 0.05, 0.2, and 0.5, holding source checkpoint, seeds, optimizer, batch policy, and probe fixture fixed. The shorter duration is diagnostic because the supplied collapse was already large by epoch 10. It is not a target-selected checkpoint rule. Noise-policy metadata is included in artifacts and the aligned checkpoint. No real target labels are involved.
+
+Neither these training experiments nor the noise-control tests were run during implementation. A restricted/fixed-time policy is an explicit experimental variant rather than the paper's uniform-time default.
