@@ -1,4 +1,5 @@
 import argparse
+from checkpoint_provenance import verify_data_fingerprint, verify_preprocessing, verify_source_pair
 import os
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -158,6 +159,8 @@ def main():
     # source-training velocity units, never target-fitted statistics.
     src_ckpt = torch.load(args.source_checkpoint, map_location=device)
     aligned_ckpt = torch.load(args.aligned_checkpoint, map_location=device)
+    verify_source_pair(args.source_checkpoint, aligned_ckpt)
+    verify_data_fingerprint(args.target_data_path, aligned_ckpt.get("target_data_fingerprint"), "target data")
     velocity_stats = aligned_ckpt if "velocity_mean" in aligned_ckpt else src_ckpt
     if "velocity_mean" not in velocity_stats or "velocity_std" not in velocity_stats:
         raise ValueError(
@@ -167,7 +170,7 @@ def main():
     if "split_indices" not in aligned_ckpt:
         raise ValueError("Aligned checkpoint is missing saved target trial splits; rerun Phase 2.")
 
-    _, _, target_test_loader, n_tgt_neurons, _ = get_nhp_dataloaders(
+    _, _, target_test_loader, n_tgt_neurons, target_metadata = get_nhp_dataloaders(
         file_path=args.target_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
@@ -177,6 +180,7 @@ def main():
         split_indices=aligned_ckpt["split_indices"],
         include_validation=False,
     )
+    verify_preprocessing(target_metadata["preprocessing"], aligned_ckpt.get("preprocessing"))
 
     # 2. Load Base Model Structure
     latent_dim = src_ckpt["latent_dim"]

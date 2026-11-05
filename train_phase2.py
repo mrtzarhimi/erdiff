@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import torch
 import torch.nn as nn
@@ -8,7 +9,7 @@ from torch.utils.data import DataLoader
 from dataloader import NHPDataset, get_nhp_dataloaders
 from vae import SequentialVAE, trajectory_smoothness_loss, sample_latent_posterior
 from train_phase1 import evaluate_phase1
-from checkpoint_provenance import file_sha256
+from checkpoint_provenance import code_revision, file_fingerprint, file_sha256
 from phase2_freeze_guard import FrozenDiffusionGuard
 from alignment_noise_bank import AlignmentNoiseBank
 from neuron_input_mapping import NeuronInputMap
@@ -17,6 +18,15 @@ from diffusion import (
     LatentDiffusionModel,
     VPSDEScheduler,
     total_alignment_loss,
+)
+from phase2_run_manifest import (
+    build_run_manifest,
+    exact_reproduction_claimable,
+    load_reference,
+    resolve_run,
+    save_run_manifest,
+    validate_reference_compatibility,
+    validate_resolved_config,
 )
 
 
@@ -163,12 +173,16 @@ def train_epoch_phase2(
     total_variance_contribution = 0.0
     total_grad_norm = 0.0
     clipped_steps = 0
+    sample_exposures = 0
+    full_variance_forwards = 0
+    full_variance_sample_exposures = 0
     source_mu, source_logvar, source_trial_ids = source_latents_bank
     num_source_samples = source_mu.size(0)
 
     for batch in target_loader:
         target_spikes = batch["spikes"].to(device)
         batch_size = target_spikes.size(0)
+        sample_exposures += batch_size
 
         optimizer.zero_grad()
 
@@ -230,6 +244,8 @@ def train_epoch_phase2(
                 loss_variance = encoder_pool_variance_loss(
                     vae.encoder, variance_pool_spikes, source_variance, mla_variance_floor
                 )
+                full_variance_forwards += 1
+                full_variance_sample_exposures += variance_pool_spikes.size(0)
             elif mla_variance_scope == "batch":
                 loss_variance = source_variance_floor_loss(mu_t, source_variance, mla_variance_floor)
             else:
@@ -269,6 +285,9 @@ def train_epoch_phase2(
         "grad_norm": total_grad_norm / batches,
         "clipped_steps": clipped_steps,
         "updates": batches,
+        "sample_exposures": sample_exposures,
+        "full_variance_forwards": full_variance_forwards,
+        "full_variance_sample_exposures": full_variance_sample_exposures,
     }
 
 
@@ -287,6 +306,10 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for target read-in probing")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Optional read-in weight decay variant")
     parser.add_argument("--epochs", type=int, default=150, help="Alignment epochs")
+    parser.add_argument("--reference_run", type=str, default=None,
+                        help="Optional immutable JSON run manifest used to lock settings and splits")
+    parser.add_argument("--factor_override", action="append", default=[], metavar="KEY=JSON",
+                        help="Declared reference factor override, e.g. mla_variance_weight=10")
     parser.add_argument("--frozen_check", choices=("final", "every_epoch"), default="every_epoch")
     parser.add_argument("--alignment_noise_mode", choices=("resampled", "fixed_bank"), default="resampled")
     parser.add_argument("--noise_seed", type=int, default=42)
@@ -317,6 +340,25 @@ def main():
     parser.add_argument("--mla_variance_scope", choices=("batch", "full_train"), default="batch",
                         help="Estimate penalty variance on the minibatch or all clean adaptation training trials")
     args = parser.parse_args()
+    factor_overrides = {}
+    for item in args.factor_override:
+        if "=" not in item:
+            raise ValueError("--factor_override must use KEY=JSON_VALUE.")
+        key, raw_value = item.split("=", 1)
+        try:
+            factor_overrides[key] = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON value for --factor_override {key!r}.") from exc
+    reference = load_reference(args.reference_run) if args.reference_run else None
+    if reference is not None and factor_overrides:
+        # Resolve first so undeclared changes fail before loading data or constructing models.
+        resolve_run(reference, factor_overrides)
+        for key, value in factor_overrides.items():
+            if not hasattr(args, key):
+                raise ValueError(f"Reference factor {key!r} has no Phase 2 CLI setting.")
+            setattr(args, key, value)
+    elif factor_overrides:
+        raise ValueError("--factor_override requires --reference_run.")
     import math
     if not math.isfinite(args.mla_variance_weight) or args.mla_variance_weight < 0:
         raise ValueError("MLA variance weight must be finite and nonnegative.")
@@ -361,7 +403,7 @@ def main():
             "Source checkpoint is missing training velocity statistics; retrain Phase 1 "
             "before alignment so target labels cannot determine the decoder scale."
         )
-    src_train_loader, src_validation_loader, _, n_src_neurons, _ = get_nhp_dataloaders(
+    src_train_loader, src_validation_loader, _, n_src_neurons, source_data_metadata = get_nhp_dataloaders(
         file_path=args.source_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
@@ -375,6 +417,11 @@ def main():
         "velocity_mean": checkpoint["velocity_mean"],
         "velocity_std": checkpoint["velocity_std"],
     }
+    reference_target_splits = None
+    if reference is not None:
+        reference_target_splits = reference.get("target_split_indices", reference.get("split_indices"))
+        if reference_target_splits is None:
+            raise ValueError("Reference manifest must contain exact target split indices.")
     tgt_train_loader, _, _, n_tgt_neurons, target_data_metadata = get_nhp_dataloaders(
         file_path=args.target_data_path,
         batch_size=args.batch_size,
@@ -382,7 +429,7 @@ def main():
         augment_multiplier=args.augment_mult,
         split_seed=args.split_seed,
         velocity_stats=checkpoint_velocity_stats,
-        split_indices=checkpoint["split_indices"] if args.source_self_check else None,
+        split_indices=(checkpoint["split_indices"] if args.source_self_check else reference_target_splits),
         include_validation=False,
         include_test=False,
         include_behavior=False,
@@ -406,6 +453,73 @@ def main():
     if args.ot_epsilon is None:
         args.ot_epsilon = 0.1 * args.seq_len * latent_dim
     print(f"Transport entropy weight: {args.ot_epsilon:g}")
+
+    runtime_config = {
+        "seed": args.seed,
+        "split_seed": target_data_metadata["split_seed"],
+        "epochs": args.epochs,
+        "seq_len": args.seq_len,
+        "latent_dim": latent_dim,
+        "hidden_dim": hidden_dim,
+        "source_neurons": n_src_neurons,
+        "target_neurons": n_tgt_neurons,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "alpha": args.alpha,
+        "ot_epsilon": args.ot_epsilon,
+        "sinkhorn_iters": args.sinkhorn_iters,
+        "smooth_weight": args.smooth_weight,
+        "mla_variance_weight": args.mla_variance_weight,
+        "mla_variance_floor": args.mla_variance_floor,
+        "mla_variance_scope": args.mla_variance_scope,
+        "mla_t_min": args.mla_t_min,
+        "mla_t_max": args.mla_t_max,
+        "mla_fixed_t": args.mla_fixed_t,
+        "readin_init": args.readin_init,
+        "augment_target": args.augment_target,
+        "augment_mult": args.augment_mult,
+        "alignment_noise_mode": args.alignment_noise_mode,
+        "noise_seed": args.noise_seed,
+        "noise_bank_replicates": args.noise_bank_replicates,
+        "log_component_gradients": args.log_component_gradients,
+        "gradient_balance": "none",
+        "frozen_check": args.frozen_check,
+        "source_self_check": args.source_self_check,
+        "optimizer": "Adam",
+        "optimizer_betas": [0.9, 0.999],
+        "optimizer_eps": 1e-8,
+        "gradient_clip_norm": 1.0,
+        "batch_sampler": "seeded_balanced_shuffle",
+        "diffusion_beta_min": noise_config["beta_min"],
+        "diffusion_beta_max": noise_config["beta_max"],
+        "diffusion_T": noise_config["T"],
+        "diffusion_t_min": noise_config["t_min"],
+    }
+    source_data_fingerprint = checkpoint.get("source_data_fingerprint")
+    if source_data_fingerprint is not None:
+        from checkpoint_provenance import verify_data_fingerprint
+        verify_data_fingerprint(args.source_data_path, source_data_fingerprint, "source data")
+    data_fingerprints = {
+        "source": file_fingerprint(args.source_data_path),
+        "target": file_fingerprint(args.target_data_path),
+    }
+    if reference is not None:
+        resolved_reference = validate_resolved_config(
+            reference,
+            {**runtime_config, "factor_overrides": factor_overrides},
+        )
+        validate_reference_compatibility(
+            reference,
+            source_checkpoint_sha256=source_fingerprint,
+            data_fingerprints=data_fingerprints,
+            split_indices=target_data_metadata["split_indices"],
+            source_split_indices=source_data_metadata["split_indices"],
+            preprocessing=target_data_metadata["preprocessing"],
+        )
+        print(f"Reference compatibility validated: {reference.get('reference_id', 'unnamed')}")
+    else:
+        resolved_reference = None
 
     vae = SequentialVAE(
         n_neurons=n_src_neurons,
@@ -490,6 +604,10 @@ def main():
     # Save the initialization for a paired, pre-alignment target baseline.
     unaligned_read_in_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
     source_self_history = []
+    completed_updates = 0
+    sample_exposures = 0
+    full_variance_forwards = 0
+    full_variance_sample_exposures = 0
     if args.source_self_check:
         source_r2, source_rmse = evaluate_phase1(vae, src_validation_loader, device)
         source_self_history.append({"epoch": 0, "r2": source_r2, "normalized_rmse": source_rmse})
@@ -550,6 +668,10 @@ def main():
         )
         if args.frozen_check == "every_epoch":
             diffusion_guard.verify((alignment_optimizer,))
+        completed_updates += align_metrics["updates"]
+        sample_exposures += align_metrics["sample_exposures"]
+        full_variance_forwards += align_metrics["full_variance_forwards"]
+        full_variance_sample_exposures += align_metrics["full_variance_sample_exposures"]
 
         if epoch % 10 == 0 or epoch == args.epochs:
             print(
@@ -573,6 +695,62 @@ def main():
             diagnostics.record(epoch, vae, diffusion_model, scheduler, device, args.batch_size)
 
     diffusion_guard.verify((alignment_optimizer,))
+    unresolved = []
+    if resolved_reference is None:
+        unresolved.append("reference_run_not_supplied")
+    if checkpoint.get("code_revision") is None:
+        unresolved.append("phase1_code_revision_missing")
+    if checkpoint.get("training_config") is None:
+        unresolved.append("phase1_training_config_missing")
+    if checkpoint.get("training_seed") is None:
+        unresolved.append("phase1_training_seed_missing")
+    if checkpoint.get("source_data_fingerprint") is None:
+        unresolved.append("phase1_source_data_fingerprint_missing")
+    if code_revision(os.path.dirname(os.path.abspath(__file__))) is None:
+        unresolved.append("phase2_code_revision_unavailable")
+    if reference is not None:
+        unresolved.extend(reference.get("unresolved", []))
+        reference_metadata_fields = (
+            "source_checkpoint_sha256", "data_fingerprints", "source_split_indices",
+            "preprocessing", "code_revision",
+        )
+        for field in reference_metadata_fields:
+            if field not in reference or reference[field] is None:
+                unresolved.append(f"reference_missing_{field}")
+        if not reference.get("target_split_indices", reference.get("split_indices")):
+            unresolved.append("reference_missing_target_split_indices")
+    recorded_config = {}
+    if resolved_reference is not None:
+        recorded_config.update(resolved_reference["resolved_config"])
+    recorded_config.update(runtime_config)
+    manifest = build_run_manifest(
+        config=recorded_config,
+        source_checkpoint=args.source_checkpoint,
+        split_indices=target_data_metadata["split_indices"],
+        source_split_indices=source_data_metadata["split_indices"],
+        data_fingerprints=data_fingerprints,
+        code_revision=code_revision(os.path.dirname(os.path.abspath(__file__))),
+        updates=completed_updates,
+        sample_exposures=sample_exposures,
+        full_variance_forwards=full_variance_forwards,
+        full_variance_sample_exposures=full_variance_sample_exposures,
+        requested_epochs=args.epochs,
+        completed_epochs=args.epochs,
+        unresolved=unresolved,
+        preprocessing=target_data_metadata["preprocessing"],
+        reference_id=None if reference is None else reference.get("reference_id"),
+    )
+    manifest["requested_updates"] = args.epochs * len(alignment_loader)
+    manifest["completed_updates"] = completed_updates
+    manifest["factor_overrides"] = factor_overrides
+    manifest["allowed_factor_overrides"] = ([] if reference is None else
+                                            reference.get("allowed_factor_overrides", []))
+    manifest["source_training_config"] = checkpoint.get("training_config")
+    manifest["source_training_seed"] = checkpoint.get("training_seed")
+    manifest["source_selected_epoch"] = checkpoint.get("epoch")
+    manifest["exact_reproduction_claimable"] = exact_reproduction_claimable(manifest)
+    manifest_path = os.path.join(args.save_dir, "phase2_run_manifest.json")
+    save_run_manifest(manifest_path, manifest)
     torch.save(
         {
             "unaligned_read_in_state": unaligned_read_in_state,
@@ -591,7 +769,17 @@ def main():
             "source_self_check": args.source_self_check,
             "source_self_history": source_self_history,
             "diffusion_training": noise_config,
-            "alignment_updates": args.epochs * len(alignment_loader),
+            "alignment_updates": completed_updates,
+            "sample_exposures": sample_exposures,
+            "full_variance_forwards": full_variance_forwards,
+            "full_variance_sample_exposures": full_variance_sample_exposures,
+            "source_data_fingerprint": data_fingerprints["source"],
+            "target_data_fingerprint": data_fingerprints["target"],
+            "preprocessing": target_data_metadata["preprocessing"],
+            "code_revision": manifest["code_revision"],
+            "training_seed": args.seed,
+            "run_manifest": manifest,
+            "run_manifest_path": os.path.realpath(manifest_path),
             "split_indices": target_data_metadata["split_indices"],
             "split_seed": target_data_metadata["split_seed"],
             "alignment_config": {

@@ -37,13 +37,15 @@
 
 **Interfaces:** `load_reference(path: str) -> dict`; `resolve_run(reference: dict, factor_overrides: dict) -> dict`; `save_run_manifest(path: str, resolved: dict) -> None`. Manifest schema version 1 contains source/data hashes, source and target split artifacts, resolved optimizer/loss/noise/sampler/initializer/preprocessing settings, code revision, seeds, epochs, update counts and exposures. Unknown historical fields carry explicit unresolved status.
 
-- [ ] Read the existing dirty diff first; identify which provenance edits are ours and preserve all other work.
-- [ ] Write checks named `test_rejects_undeclared_hyperparameter_override`, `test_mismatched_source_or_split_fails`, and `test_missing_historical_fields_prevent_exact_reproduction_claim`.
-- [ ] Implement reference validation and resolved-config serialization. Reuse the pending hashing/pairing helper after review rather than adding another incompatible fingerprint implementation.
-- [ ] Require exact saved target indices where a reference provides them; validate raw-window and data compatibility. Do not load historical read-in weights as an accidental initializer.
-- [ ] Count optimizer updates and MLA exposures from the actual sampler; count full-variance forwards separately. Store requested and completed budgets.
+- [x] Read the existing dirty diff first; identify which provenance edits are ours and preserve all other work.
+- [x] Write checks named `test_rejects_undeclared_hyperparameter_override`, `test_mismatched_source_or_split_fails`, and `test_missing_historical_fields_prevent_exact_reproduction_claim`.
+- [x] Implement reference validation and resolved-config serialization. Reuse the pending hashing/pairing helper after review rather than adding another incompatible fingerprint implementation.
+- [x] Require exact saved target indices where a reference provides them; validate raw-window and data compatibility. Do not load historical read-in weights as an accidental initializer.
+- [x] Count optimizer updates and MLA exposures from the actual sampler; count full-variance forwards separately. Store requested and completed budgets.
 - [ ] When verification is authorized: `pytest tests/test_phase2_run_manifest.py tests/test_checkpoint_provenance.py -q`; expected tests pass. Until then record static review only.
-- [ ] Commit: `feat: lock Phase 2 reference configuration and artifact provenance`.
+- [x] Commit: `feat: lock Phase 2 reference configuration and artifact provenance`.
+
+**Execution note:** implementation and tests are written; test execution remains intentionally pending under the user's no-execution instruction. Static review only is claimed.
 
 ### Task 2: Enforce the frozen denoiser invariant
 

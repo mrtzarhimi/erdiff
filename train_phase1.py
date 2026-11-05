@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from checkpoint_provenance import code_revision, file_fingerprint
 
 from dataloader import NHPDataset, denormalize_velocity, get_nhp_dataloaders
 from vae import SequentialVAE, poisson_nll_loss, kl_divergence_loss, trajectory_smoothness_loss, sample_latent_posterior
@@ -278,6 +279,8 @@ def main():
     best_val_r2 = -float("inf")
     best_epoch = None
     save_path = os.path.join(args.save_dir, "phase1_source_models.pt")
+    source_code_revision = code_revision(os.path.dirname(os.path.abspath(__file__)))
+    source_data_provenance = file_fingerprint(args.data_path)
 
     print("\nStarting Cooperative Source Domain Training (Phase 1)...")
     for epoch in range(1, args.epochs + 1):
@@ -310,6 +313,10 @@ def main():
             torch.save(
                 {
                     "epoch": epoch,
+                    "training_seed": args.seed,
+                    "training_config": vars(args).copy(),
+                    "code_revision": source_code_revision,
+                    "source_data_fingerprint": source_data_provenance,
                     "vae_state_dict": vae.state_dict(),
                     "dm_state_dict": diffusion_model.state_dict(),
                     "n_neurons": n_neurons,
