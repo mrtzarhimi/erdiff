@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from dataloader import get_nhp_dataloaders
+from dataloader import denormalize_velocity, get_nhp_dataloaders
 from vae import SequentialVAE
 from decoder_models import compute_r2_score, compute_rmse
 
@@ -143,17 +143,26 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Load Target Validation Split
-    _, target_test_loader, n_tgt_neurons = get_nhp_dataloaders(
+    # 1. Load checkpoints and source-fitted velocity units before making the
+    # untouched target test loader.
+    src_ckpt = torch.load(args.source_checkpoint, map_location=device)
+    aligned_ckpt = torch.load(args.aligned_checkpoint, map_location=device)
+    velocity_stats = aligned_ckpt if "velocity_mean" in aligned_ckpt else src_ckpt
+    if "velocity_mean" not in velocity_stats or "velocity_std" not in velocity_stats:
+        raise ValueError(
+            "Checkpoint is missing source-training velocity statistics; retrain Phase 1/2 "
+            "before evaluating to avoid target-derived normalization."
+        )
+
+    _, _, target_test_loader, n_tgt_neurons, _ = get_nhp_dataloaders(
         file_path=args.target_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
+        seed=args.seed,
         augment_multiplier=1,
+        velocity_stats=velocity_stats,
+        include_validation=False,
     )
-
-    # 2. Load Base Model Structure from Phase 1
-    src_ckpt = torch.load(args.source_checkpoint, map_location=device)
-    aligned_ckpt = torch.load(args.aligned_checkpoint, map_location=device)
 
     latent_dim = src_ckpt["latent_dim"]
     hidden_dim = src_ckpt["hidden_dim"]
@@ -179,6 +188,8 @@ def main():
         vae.encoder.read_in.load_state_dict(aligned_ckpt["unaligned_read_in_state"])
 
     unaligned_latents, unaligned_pred_v, true_v, targets = run_inference(vae, target_test_loader, device)
+    true_v = denormalize_velocity(true_v.to(device), velocity_stats).cpu()
+    unaligned_pred_v = denormalize_velocity(unaligned_pred_v.to(device), velocity_stats).cpu()
     r2_unaligned = compute_r2_score(true_v, unaligned_pred_v)
     rmse_unaligned = compute_rmse(true_v, unaligned_pred_v)
 
@@ -193,6 +204,7 @@ def main():
     vae.encoder.read_in.load_state_dict(aligned_ckpt["target_read_in_state"])
 
     aligned_latents, aligned_pred_v, _, _ = run_inference(vae, target_test_loader, device)
+    aligned_pred_v = denormalize_velocity(aligned_pred_v.to(device), velocity_stats).cpu()
     r2_aligned = compute_r2_score(true_v, aligned_pred_v)
     rmse_aligned = compute_rmse(true_v, aligned_pred_v)
 

@@ -144,11 +144,12 @@ def main():
     print(f"Using device: {device}")
 
     # 1. Load Data with Augmentation
-    train_loader, val_loader, n_neurons = get_nhp_dataloaders(
+    train_loader, val_loader, _, n_neurons, velocity_stats = get_nhp_dataloaders(
         file_path=args.data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         augment_multiplier=args.augment_mult,
+        seed=args.seed,
     )
     print(f"Loaded source domain with {n_neurons} neurons across trials of length {args.seq_len}.")
 
@@ -214,6 +215,8 @@ def main():
                     "latent_dim": args.latent_dim,
                     "hidden_dim": args.hidden_dim,
                     "best_r2": best_val_r2,
+                    "velocity_mean": velocity_stats["velocity_mean"],
+                    "velocity_std": velocity_stats["velocity_std"],
                 },
                 save_path,
             )

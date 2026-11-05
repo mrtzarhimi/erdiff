@@ -11,7 +11,9 @@ In brain-computer interface (BCI) decoding, raw neural population activities shi
 
 **ERDiff** tackles this via a two-phase protocol:
 1. **Extraction (Phase 1):** Jointly trains a Sequential Variational Autoencoder (VAE), a kinematics behavior decoder, and a Diffusion Model (DM) over the source domain. The DM employs stacked **Spatio-Temporal Transformer Blocks (STBlocks)** to extract global trajectory dynamics and cross-dimensional correlations.
-2. **Recovery / Alignment (Phase 2):** Performs test-time adaptation on the target domain via **Maximum Likelihood Alignment (MLA)** and Sinkhorn divergence. The DM, the VAE decoder, and the behavior decoder are kept frozen; only the linear read-in projection of the encoder is probed to fit the learned source manifold.
+2. **Recovery / Alignment (Phase 2):** Performs target-domain adaptation via **Maximum Likelihood Alignment (MLA)** and the configured Sinkhorn loss. Target behavior labels are excluded from adaptation and checkpoint selection; the final configured epoch is evaluated on a disjoint held-out test partition.
+
+Evaluation uses deterministic trial partitions, go-cue-relative input windows, source-training velocity normalization, and test-only target metrics. Overlapping windows are kept in the same partition, and spike smoothing is applied within each trial window.
 
 ---
 
@@ -19,11 +21,12 @@ In brain-computer interface (BCI) decoding, raw neural population activities shi
 
 ```text
 .
-├── dataloader.py        # Chewie_CO .mat parser, time-binning (39 bins), velocity normalization
+├── dataloader.py        # Chewie_CO .mat parser, cue-relative windows, trial splits, source velocity scaling
 ├── vae.py               # Sequential VAE (ELU, GRU, Poisson NLL, analytic KL divergence)
 ├── diffusion.py         # STBlock Transformer denoiser, VP-SDE schedule, MLA & Sinkhorn losses
 ├── decoder_models.py    # Ridge kinematics regressor, direction classifier, R2 / RMSE metrics
 ├── train_phase1.py      # Source-domain offline cooperative training loop (Algorithm 1)
 ├── train_phase2.py      # Unsupervised target-domain linear probing / alignment loop (Algorithm 2)
-├── eval.py              # Zero-shot kinematics evaluation & 3D neural manifold visualizer
+├── evaluate.py          # Single-session held-out evaluation & manifold visualizer
+├── evaluate_cross_day.py # Cross-day held-out evaluation
 └── README.md

@@ -26,11 +26,13 @@ class NHPDataset(Dataset):
         is_train: bool = False,
         augment_multiplier: int = 5,
         noise_factor: float = 0.08,
+        include_behavior: bool = True,
     ):
         self.spikes = spikes
         self.velocities = velocities
         self.targets = targets
         self.is_train = is_train
+        self.include_behavior = include_behavior
         self.multiplier = augment_multiplier if is_train else 1
         self.noise_transform = AddGaussianNoise(factor=noise_factor)
 
@@ -40,18 +42,16 @@ class NHPDataset(Dataset):
     def __getitem__(self, idx):
         base_idx = idx % self.spikes.shape[0]
         spk = self.spikes[base_idx].clone()
-        vel = self.velocities[base_idx].clone()
-        tgt = self.targets[base_idx]
 
         if self.is_train:
             spk = self.noise_transform(spk)
             spk = torch.clamp(spk, min=0.0)
 
-        return {
-            "spikes": spk,
-            "velocity": vel,
-            "target": tgt,
-        }
+        sample = {"spikes": spk}
+        if self.include_behavior:
+            sample["velocity"] = self.velocities[base_idx].clone()
+            sample["target"] = self.targets[base_idx]
+        return sample
 
 
 def load_nhp_session(
@@ -60,12 +60,10 @@ def load_nhp_session(
     smooth_sigma: float = 2.5,
     neural_lag_bins: int = 4,  # Motor cortex spikes lead hand velocity by ~80ms (4 bins)
 ):
-    """
-    Fixes Smoking Gun 3:
-      1. Identifies exact movement peak / onset inside each trial window so all trials
-         are phase-aligned in continuous time.
-      2. Accounts for the ~80ms (4-bin) biophysical delay between M1 neural spiking
-         and physical hand velocity.
+    """Load fixed cue-aligned trials without using behavior values to place windows.
+
+    Velocity peaks are deliberately not used for window selection: doing so would
+    let target behavior determine which neural samples enter evaluation.
     """
     data_dict = mat73.loadmat(file_path)
     xds = data_dict["xds"]
@@ -74,15 +72,9 @@ def load_nhp_session(
     if raw_spikes.shape[0] < raw_spikes.shape[1]:
         raw_spikes = raw_spikes.T
 
-    # Smooth spike trains into continuous firing rate profiles
-    if smooth_sigma > 0:
-        raw_spikes = scipy.ndimage.gaussian_filter1d(raw_spikes, sigma=smooth_sigma, axis=0)
-
     raw_velocity = np.array(xds["curs_v"], dtype=np.float32)
     if raw_velocity.shape[0] < raw_velocity.shape[1]:
         raw_velocity = raw_velocity.T
-    raw_speed = np.linalg.norm(raw_velocity, axis=1)
-
     time_frame = np.array(xds["time_frame"]).flatten()
     go_cues = np.array(xds.get("trial_gocue_time", xds.get("trial_start_time"))).flatten()
     if np.all(np.isnan(go_cues)):
@@ -97,8 +89,7 @@ def load_nhp_session(
     trials_spikes = []
     trials_vel = []
     trials_targets = []
-
-    half_len = seq_len // 2  # 19 bins before peak speed, 20 bins after
+    trial_intervals = []
 
     for i in range(len(go_cues)):
         t_go = go_cues[i]
@@ -113,28 +104,29 @@ def load_nhp_session(
 
         idx_go = np.searchsorted(time_frame, t_go)
         idx_stop = np.searchsorted(time_frame, t_stop)
-        if idx_stop <= idx_go + 5:
-            idx_stop = idx_go + seq_len + 10
+        vel_start, vel_end, spk_start, spk_end = fixed_window_bounds(
+            go_index=idx_go,
+            seq_len=seq_len,
+            neural_lag_bins=neural_lag_bins,
+        )
 
-        # Find peak velocity bin within the reach window to eliminate reaction-time jitter
-        search_end = min(raw_speed.shape[0], idx_stop)
-        if search_end <= idx_go:
-            continue
-
-        local_peak_offset = np.argmax(raw_speed[idx_go:search_end])
-        peak_idx = idx_go + local_peak_offset
-
-        # Center velocity window around the reach movement
-        vel_start = peak_idx - half_len
-        vel_end = vel_start + seq_len
-
-        # Shift neural window back by `neural_lag_bins` (~80ms) because M1 drives future velocity
-        spk_start = vel_start - neural_lag_bins
-        spk_end = spk_start + seq_len
-
-        if spk_start >= 0 and vel_end <= raw_spikes.shape[0]:
-            trials_spikes.append(raw_spikes[spk_start:spk_end, :])
+        if (
+            idx_stop > idx_go
+            and vel_end <= idx_stop
+            and spk_start >= 0
+            and spk_end <= raw_spikes.shape[0]
+            and vel_end <= raw_velocity.shape[0]
+        ):
+            spike_window = raw_spikes[spk_start:spk_end, :]
+            if smooth_sigma > 0:
+                # Smooth within a trial only, so a neighboring trial assigned
+                # to another split cannot contribute signal across its boundary.
+                spike_window = scipy.ndimage.gaussian_filter1d(
+                    spike_window, sigma=smooth_sigma, axis=0
+                )
+            trials_spikes.append(spike_window)
             trials_vel.append(raw_velocity[vel_start:vel_end, :])
+            trial_intervals.append((spk_start, max(spk_end, vel_end)))
 
             if target_angles is not None:
                 deg = np.rad2deg(target_angles[i]) % 360
@@ -150,44 +142,166 @@ def load_nhp_session(
     y_data = torch.tensor(np.array(trials_vel), dtype=torch.float32)
     targets = torch.tensor(np.array(trials_targets), dtype=torch.long)
 
-    return x_data, y_data, targets
+    return x_data, y_data, targets, torch.tensor(trial_intervals, dtype=torch.long)
+
+
+def fixed_window_bounds(go_index: int, seq_len: int, neural_lag_bins: int = 0):
+    """Return velocity and spike window bounds from the go cue alone."""
+    vel_start = go_index
+    vel_end = vel_start + seq_len
+    spk_start = vel_start - neural_lag_bins
+    spk_end = spk_start + seq_len
+    return vel_start, vel_end, spk_start, spk_end
+
+
+def denormalize_velocity(velocity: torch.Tensor, velocity_stats):
+    """Convert source-standardized decoder values back to physical units."""
+    mean = torch.as_tensor(velocity_stats["velocity_mean"], dtype=velocity.dtype, device=velocity.device)
+    std = torch.as_tensor(velocity_stats["velocity_std"], dtype=velocity.dtype, device=velocity.device)
+    return velocity * std.reshape(1, 1, -1) + mean.reshape(1, 1, -1)
+
+
+def split_trial_indices(
+    num_trials: int,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+    window_intervals=None,
+):
+    """Create a reproducible, disjoint train/validation/test trial split."""
+    if num_trials < 3:
+        raise ValueError("At least three trials are required for train/validation/test splits.")
+    if val_ratio < 0 or test_ratio < 0 or val_ratio + test_ratio >= 1:
+        raise ValueError("val_ratio and test_ratio must be non-negative and sum to less than 1.")
+
+    val_size = max(1, int(num_trials * val_ratio))
+    test_size = max(1, int(num_trials * test_ratio))
+    if val_size + test_size >= num_trials:
+        raise ValueError("Split ratios leave no training trials; use more trials or smaller ratios.")
+
+    generator = torch.Generator().manual_seed(seed)
+    if window_intervals is None:
+        groups = [torch.tensor([i], dtype=torch.long) for i in range(num_trials)]
+    else:
+        intervals = torch.as_tensor(window_intervals, dtype=torch.long)
+        if intervals.shape != (num_trials, 2):
+            raise ValueError("window_intervals must have shape (num_trials, 2).")
+        ordered = sorted(range(num_trials), key=lambda i: (intervals[i, 0].item(), intervals[i, 1].item()))
+        groups = []
+        current = []
+        current_end = -1
+        for index in ordered:
+            start, end = intervals[index].tolist()
+            if current and start >= current_end:
+                groups.append(torch.tensor(current, dtype=torch.long))
+                current = []
+            current.append(index)
+            current_end = max(current_end, end)
+        if current:
+            groups.append(torch.tensor(current, dtype=torch.long))
+        if len(groups) < 3:
+            raise ValueError("At least three non-overlapping trial-window groups are required for evaluation splits.")
+
+    group_order = torch.randperm(len(groups), generator=generator).tolist()
+    train_groups = [groups[group_order[0]]]
+    val_groups = [groups[group_order[1]]]
+    test_groups = [groups[group_order[2]]]
+    counts = {"train": len(train_groups[0]), "val": len(val_groups[0]), "test": len(test_groups[0])}
+    targets = {"train": num_trials - val_size - test_size, "val": val_size, "test": test_size}
+    for group_index in group_order[3:]:
+        split_name = max(targets, key=lambda name: targets[name] - counts[name])
+        group = groups[group_index]
+        if split_name == "train":
+            train_groups.append(group)
+        elif split_name == "val":
+            val_groups.append(group)
+        else:
+            test_groups.append(group)
+        counts[split_name] += len(group)
+
+    train_idx = torch.cat(train_groups)
+    val_idx = torch.cat(val_groups)
+    test_idx = torch.cat(test_groups)
+    return train_idx, val_idx, test_idx
 
 
 def get_nhp_dataloaders(
     file_path: str,
     batch_size: int = 64,
-    val_ratio: float = 0.2,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
     seed: int = 42,
     seq_len: int = 39,
     augment_multiplier: int = 5,
+    velocity_stats=None,
+    include_validation: bool = True,
+    include_test: bool = True,
+    include_behavior: bool = True,
 ):
-    x_data, y_data, targets = load_nhp_session(file_path=file_path, seq_len=seq_len)
+    x_data, y_data, targets, window_intervals = load_nhp_session(file_path=file_path, seq_len=seq_len)
     num_trials = x_data.shape[0]
 
-    torch.manual_seed(seed)
-    perm = torch.randperm(num_trials)
-    val_size = int(num_trials * val_ratio)
+    train_idx, val_idx, test_idx = split_trial_indices(
+        num_trials=num_trials,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=seed,
+        window_intervals=window_intervals,
+    )
 
-    val_idx = perm[:val_size]
-    train_idx = perm[val_size:]
+    x_train = x_data[train_idx]
+    if include_behavior:
+        y_train = y_data[train_idx]
+        t_train = targets[train_idx]
+    else:
+        if velocity_stats is None:
+            raise ValueError("velocity_stats are required when behavior labels are excluded.")
+        y_train = torch.zeros((len(train_idx), seq_len, y_data.shape[-1]), dtype=y_data.dtype)
+        t_train = torch.zeros(len(train_idx), dtype=targets.dtype)
 
-    x_train, y_train = x_data[train_idx], y_data[train_idx]
-    x_val, y_val = x_data[val_idx], y_data[val_idx]
-    t_train, t_val = targets[train_idx], targets[val_idx]
-
-    # Normalize velocity using training statistics only
-    y_mean = y_train.mean(dim=(0, 1), keepdim=True)
-    y_std = y_train.std(dim=(0, 1), keepdim=True) + 1e-6
+    # Fit source-domain units on training trials only. Target sessions pass the
+    # source statistics here so target labels never fit their own scale.
+    if velocity_stats is None:
+        y_mean = y_train.mean(dim=(0, 1), keepdim=True)
+        y_std = y_train.std(dim=(0, 1), keepdim=True) + 1e-6
+    else:
+        y_mean = torch.as_tensor(
+            velocity_stats["velocity_mean"], dtype=y_train.dtype, device="cpu"
+        ).reshape(1, 1, -1)
+        y_std = torch.as_tensor(
+            velocity_stats["velocity_std"], dtype=y_train.dtype, device="cpu"
+        ).reshape(1, 1, -1)
 
     y_train = (y_train - y_mean) / y_std
-    y_val = (y_val - y_mean) / y_std
 
     train_dataset = NHPDataset(
-        x_train, y_train, t_train, is_train=True, augment_multiplier=augment_multiplier
+        x_train, y_train, t_train, is_train=True, augment_multiplier=augment_multiplier,
+        include_behavior=include_behavior,
     )
-    val_dataset = NHPDataset(x_val, y_val, t_val, is_train=False)
-
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    return train_loader, val_loader, x_data.shape[-1]
+    val_loader = None
+    if include_validation:
+        x_val, y_val = x_data[val_idx], y_data[val_idx]
+        t_val = targets[val_idx]
+        y_val = (y_val - y_mean) / y_std
+        val_dataset = NHPDataset(
+            x_val, y_val, t_val, is_train=False, include_behavior=include_behavior
+        )
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    test_loader = None
+    if include_test:
+        x_test, y_test = x_data[test_idx], y_data[test_idx]
+        t_test = targets[test_idx]
+        y_test = (y_test - y_mean) / y_std
+        test_dataset = NHPDataset(
+            x_test, y_test, t_test, is_train=False, include_behavior=include_behavior
+        )
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    stats = {
+        "velocity_mean": y_mean.reshape(-1).detach().cpu(),
+        "velocity_std": y_std.reshape(-1).detach().cpu(),
+    }
+    return train_loader, val_loader, test_loader, x_data.shape[-1], stats

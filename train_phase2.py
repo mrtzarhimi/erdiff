@@ -11,7 +11,6 @@ from diffusion import (
     VPSDEScheduler,
     total_alignment_loss,
 )
-from decoder_models import compute_r2_score, compute_rmse
 
 
 def set_seed(seed: int = 42):
@@ -150,37 +149,6 @@ def train_epoch_phase2(
     return total_loss / len(target_loader)
 
 
-@torch.no_grad()
-def evaluate_target_alignment(
-    vae: SequentialVAE,
-    target_loader,
-    device: torch.device,
-):
-    """
-    Evaluates zero-shot kinematics decoding on target domain (R^2 and RMSE).
-    """
-    vae.eval()
-    all_preds = []
-    all_targets = []
-
-    for batch in target_loader:
-        spikes = batch["spikes"].to(device)
-        velocity = batch["velocity"].to(device)
-
-        mu, _ = vae.encoder(spikes)
-        pred_vel = vae.behavior_decoder(mu)
-
-        all_preds.append(pred_vel.cpu())
-        all_targets.append(velocity.cpu())
-
-    all_preds = torch.cat(all_preds, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-
-    r2 = compute_r2_score(all_targets, all_preds)
-    rmse = compute_rmse(all_targets, all_preds)
-    return r2, rmse
-
-
 def main():
     parser = argparse.ArgumentParser(description="Phase 2: Target Domain Maximum Likelihood Alignment (ERDiff)")
     parser.add_argument("--seed", type=int, default=42, help="Random state seed")
@@ -204,22 +172,37 @@ def main():
     print(f"Using device: {device}")
 
     # 1. Load Source and Target Data
-    src_train_loader, _, n_src_neurons = get_nhp_dataloaders(
+    src_train_loader, _, _, n_src_neurons, _ = get_nhp_dataloaders(
         file_path=args.source_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         augment_multiplier=1,  # Clean source bank
+        seed=args.seed,
     )
-    tgt_train_loader, tgt_val_loader, n_tgt_neurons = get_nhp_dataloaders(
+    checkpoint = torch.load(args.source_checkpoint, map_location=device)
+    if "velocity_mean" not in checkpoint or "velocity_std" not in checkpoint:
+        raise ValueError(
+            "Source checkpoint is missing training velocity statistics; retrain Phase 1 "
+            "before alignment so target labels cannot determine the decoder scale."
+        )
+    checkpoint_velocity_stats = {
+        "velocity_mean": checkpoint["velocity_mean"],
+        "velocity_std": checkpoint["velocity_std"],
+    }
+    tgt_train_loader, _, _, n_tgt_neurons, _ = get_nhp_dataloaders(
         file_path=args.target_data_path,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         augment_multiplier=args.augment_mult,
+        seed=args.seed,
+        velocity_stats=checkpoint_velocity_stats,
+        include_validation=False,
+        include_test=False,
+        include_behavior=False,
     )
     print(f"Source neurons: {n_src_neurons} | Target neurons: {n_tgt_neurons}")
 
     # 2. Restore Source Models from Phase 1
-    checkpoint = torch.load(args.source_checkpoint, map_location=device)
     latent_dim = checkpoint["latent_dim"]
     hidden_dim = checkpoint["hidden_dim"]
 
@@ -267,14 +250,8 @@ def main():
     )
     scheduler = VPSDEScheduler()
 
-    # Evaluate Before Alignment (Direct Transfer / Warm-Start Unaligned Baseline)
-    pre_r2, pre_rmse = evaluate_target_alignment(vae, tgt_val_loader, device)
-    print(f"Target Performance BEFORE Alignment: R^2 = {pre_r2:.2f}% | RMSE = {pre_rmse:.4f}")
-
-    # Save unaligned state so eval.py can compare exact before vs. after
+    # Save the pre-alignment state for an unbiased direct-transfer comparison.
     unaligned_read_in_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
-    best_aligned_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
-    best_target_r2 = pre_r2
 
     save_path = os.path.join(args.save_dir, "phase2_aligned_target_model.pt")
 
@@ -291,32 +268,25 @@ def main():
             alpha=args.alpha,
         )
 
-        target_r2, target_rmse = evaluate_target_alignment(vae, tgt_val_loader, device)
-
         if epoch % 10 == 0 or epoch == args.epochs:
             print(
                 f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
-                f"Alignment Loss: {align_loss:.4f} | "
-                f"Target Val R^2: {target_r2:6.2f}% | Target RMSE: {target_rmse:.4f}"
+                f"Alignment Loss: {align_loss:.4f}"
             )
-
-        if target_r2 > best_target_r2:
-            best_target_r2 = target_r2
-            best_aligned_state = {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()}
 
     torch.save(
         {
             "unaligned_read_in_state": unaligned_read_in_state,
-            "target_read_in_state": best_aligned_state,
+            "target_read_in_state": {k: v.clone() for k, v in vae.encoder.read_in.state_dict().items()},
             "target_n_neurons": n_tgt_neurons,
-            "pre_r2": pre_r2,
-            "best_target_r2": best_target_r2,
+            "velocity_mean": checkpoint_velocity_stats["velocity_mean"],
+            "velocity_std": checkpoint_velocity_stats["velocity_std"],
+            "alignment_epochs": args.epochs,
         },
         save_path,
     )
 
-    print(f"\nAlignment Complete!")
-    print(f"Unaligned R^2: {pre_r2:.2f}%  -->  ERDiff Aligned R^2: {best_target_r2:.2f}%")
+    print(f"\nAlignment Complete after {args.epochs} fixed epochs.")
     print(f"Saved aligned target checkpoint to: {save_path}")
 
 

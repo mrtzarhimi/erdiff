@@ -130,6 +130,7 @@ def main():
         print(f"=== Starting Phase 1 Source Training on {args.source_file} ===")
         cmd_p1 = [
             "python", "train_phase1.py",
+            "--seed", str(args.seed),
             "--data_path", source_path,
             "--save_dir", args.checkpoints_dir,
             "--seq_len", str(args.seq_len),
@@ -174,6 +175,7 @@ def main():
         # 1. Run Phase 2 Alignment
         cmd_p2 = [
             "python", "train_phase2.py",
+            "--seed", str(args.seed),
             "--source_checkpoint", phase1_ckpt,
             "--source_data_path", source_path,
             "--target_data_path", target_path,
@@ -196,6 +198,7 @@ def main():
         # 2. Run Evaluation & Plot Generation
         cmd_eval = [
             "python", "evaluate_cross_day.py",
+            "--seed", str(args.seed),
             "--source_checkpoint", phase1_ckpt,
             "--aligned_checkpoint", target_ckpt_path,
             "--target_data_path", target_path,
