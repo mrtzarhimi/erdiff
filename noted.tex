@@ -477,6 +477,27 @@ setting for this normalized objective. Old calibration files and controlled
 references must be regenerated. No performance gain is established by this
 change; the value, gradient and finite-difference tests are written but unrun.
 
+\subsection{Numerical revision after iteration-zero transport failures}
+
+The supplied cross-day log reports a POT numerical error at iteration zero,
+followed by nonfinite alignment losses. Source-only calibration had finite
+gradients ($c_{\mathrm{OT}}=56.8831$), but this does not certify target-batch
+numerics. Ordinary Sinkhorn forms $K=\exp(-\bar C/\varepsilon)$; at
+$\varepsilon=0.01$ its entries can approach $\exp(-100)$, making float32
+reciprocal updates and their derivatives fragile. The first nonfinite tensor
+was not captured in that run, so the precise initiating operation remains
+unresolved.
+
+We retain \texttt{ot.sinkhorn2}, the normalized cost, $\varepsilon=0.01$,
+and the entropy-excluding return value. The numerical implementation now uses
+\texttt{method="sinkhorn\_log"} with float64 inputs and returns the scalar in
+the target model's dtype. Differentiable casts preserve the gradient path.
+This targets the same mathematical objective, while finite-iteration values
+and gradients need not be identical to a conventional solve. The numerical
+method and precision are recorded in transport provenance, invalidating old
+calibration artifacts. CPU and optional CUDA regression checks are written
+for separated float32 domains, but remain unrun.
+
 \section{Learned posterior variance without output clamps}
 
 The author VAE computes log variance with a linear head without bounding

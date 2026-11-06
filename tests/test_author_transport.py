@@ -18,8 +18,10 @@ def test_transport_matches_author_sinkhorn2_value_and_autograd():
                             cost / cost.max(), reg=0.07, numItermax=1000)
     expected_gradient = torch.autograd.grad(expected, reference_target)[0]
 
-    torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(actual_gradient, expected_gradient)
+    # The production log-domain solve targets the same value/gradient as
+    # conventional Sinkhorn on this well-conditioned float64 fixture.
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-8)
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-6, atol=1e-8)
     assert actual_gradient.norm() > 0
 
 
@@ -50,3 +52,30 @@ def test_symmetric_transport_returns_cost_without_explicit_entropy():
 def test_invalid_transport_settings_are_rejected(epsilon, num_iters):
     with pytest.raises(ValueError):
         sinkhorn_loss(torch.zeros(2, 1, 1), torch.ones(2, 1, 1), epsilon, num_iters)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_small_regularization_with_separated_float32_domains_has_finite_gradient(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    # All normalized costs are near one, so ordinary exp(-C/0.01) produces
+    # subnormal kernels and unsafe reciprocal updates in float32.
+    source = torch.tensor([[[0.0]], [[1.0]]], device=device)
+    target = torch.tensor([[[100.0]], [[101.0]]], device=device, requires_grad=True)
+    value = sinkhorn_loss(source, target, epsilon=0.01)
+    gradient = torch.autograd.grad(value, target)[0]
+
+    assert value.dtype == target.dtype
+    assert value.device == target.device
+    assert torch.isfinite(value)
+    assert torch.isfinite(gradient).all()
+    assert gradient.norm() > 0
+    # Independent float64 reference from POT's log-domain implementation.
+    reference_target = target.detach().double().requires_grad_(True)
+    cost = ot.dist(source.double().flatten(1), reference_target.flatten(1)) + 1e-4
+    mass = cost.new_full((2,), 0.5)
+    expected = ot.sinkhorn2(mass, mass, cost / cost.max(), reg=0.01,
+                            method="sinkhorn_log", numItermax=1000, stopThr=1e-9)
+    expected_gradient = torch.autograd.grad(expected, reference_target)[0]
+    torch.testing.assert_close(value, expected.float())
+    torch.testing.assert_close(gradient, expected_gradient.float())

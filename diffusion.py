@@ -296,7 +296,8 @@ def transport_configuration():
         "cost": "squared_euclidean_trajectory_plus_1e-4_divided_by_max",
         "return_value": "transport_cost_without_entropy",
         "gradient": "autograd_through_sinkhorn_and_cost_normalization",
-        "method": "sinkhorn",
+        "method": "sinkhorn_log",
+        "compute_dtype": "torch.float64",
         "stop_threshold": 1e-9,
         "pot_version": ot.__version__,
     }
@@ -309,11 +310,13 @@ def sinkhorn_loss(
     num_iters: int = 1000,
 ) -> torch.Tensor:
     """
-    Match the pinned 2023 author implementation, MLA_Model.py:190-195.
+    Match the objective in the 2023 author implementation, MLA_Model.py:190-195.
 
     POT solves for an entropy-regularized plan but sinkhorn2 returns only
     <plan, normalized_cost>. This differs from the paper's explicit entropy
     term. Gradients include both the iterations and cost.max() normalization.
+    Log-domain iterations and float64 arithmetic stabilize the same objective;
+    they are a documented numerical departure from the author's default solver.
     """
     if not math.isfinite(epsilon) or epsilon <= 0 or num_iters < 1:
         raise ValueError("Sinkhorn epsilon and iteration count must be positive.")
@@ -321,16 +324,17 @@ def sinkhorn_loss(
 
     b_s = z_source.size(0)
     b_t = z_target.size(0)
-    x = z_source.reshape(b_s, -1)
-    y = z_target.reshape(b_t, -1)
+    x = z_source.reshape(b_s, -1).to(torch.float64)
+    y = z_target.reshape(b_t, -1).to(torch.float64)
     cost = ot.dist(x, y, metric="sqeuclidean") + 1e-4
     cost = cost / cost.max()
     source_mass = cost.new_full((b_s,), 1.0 / b_s)
     target_mass = cost.new_full((b_t,), 1.0 / b_t)
-    return ot.sinkhorn2(
-        source_mass, target_mass, cost, reg=epsilon, method="sinkhorn",
+    loss = ot.sinkhorn2(
+        source_mass, target_mass, cost, reg=epsilon, method="sinkhorn_log",
         numItermax=num_iters, stopThr=1e-9,
     )
+    return loss.to(z_target.dtype)
 
 
 def total_alignment_loss(

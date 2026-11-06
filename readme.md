@@ -21,7 +21,12 @@ on `(squared_trajectory_distance + 1e-4) / max(cost)`, with default
 with `pip install -r requirements-transport.txt` before using it. No package
 installation was performed during this change. The objective returns transport
 cost without an explicit entropy term, and differentiates through both the
-solver and maximum normalization. It differs from the paper's written
+solver and maximum normalization. The numerical solver now uses
+`method="sinkhorn_log"` and float64 transport arithmetic to avoid the reported
+iteration-zero failure of conventional float32 Sinkhorn at `reg=0.01`.
+It targets the same transport objective; it is a numerical departure from
+the author's default solver, not a new entropy term or a detached-plan gradient.
+It differs from the paper's written
 entropy-inclusive objective and from our former implementation.
 
 Do not reuse `--phase2_ot_epsilon 31.2` from previous commands: it was calibrated
