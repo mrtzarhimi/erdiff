@@ -477,6 +477,47 @@ setting for this normalized objective. Old calibration files and controlled
 references must be regenerated. No performance gain is established by this
 change; the value, gradient and finite-difference tests are written but unrun.
 
+\section{Learned posterior variance without output clamps}
+
+The author VAE computes log variance with a linear head without bounding
+its output (\path{model_functions/VAE.py}, line 105 in the pinned
+snapshot). New local Phase 1 models now use
+\begin{equation}
+ \ell_\phi(x)=W_\ell h_\phi(x)+b_\ell,\qquad
+ q_\phi(z\mid x)=\mathcal N\!\left(\mu_\phi(x),
+       \operatorname{diag}(e^{\ell_\phi(x)})\right),\qquad
+ z=\mu_\phi(x)+e^{\ell_\phi(x)/2}\odot\eta,
+ \quad\eta\sim\mathcal N(0,I).
+\end{equation}
+Previously, clamping $\ell$ to $[-5,0]$ restricted posterior variance to
+$[e^{-5},1]$ and set the head's gradient to zero outside those bounds.
+For the unclamped standard-normal KL,
+\begin{equation}
+ \frac{\partial\operatorname{KL}(q\Vert\mathcal N(0,I))}
+      {\partial\ell_j}=\tfrac12(e^{\ell_j}-1),
+\end{equation}
+before the configured averaging and loss coefficient. This permits the
+head to learn small or large uncertainty rather than saturating at the
+artificial boundaries. Exponentiation can still overflow for extreme
+outputs; removing clamps is not a numerical stability guarantee. We retain
+the previous bias $-3$ and Xavier gain $0.1$ initialization as an explicitly
+local choice, without claiming the full author architecture is reproduced.
+
+The optional \texttt{legacy\_clamped} setting preserves previous experiments.
+New checkpoints record the mode and bounds. All source-model loaders restore
+that setting; checkpoints predating the field retain their original clamp.
+New-format checkpoints with missing or contradictory metadata are rejected.
+It would be inconsistent to remove the clamp only in Phase 2 while retaining
+a denoiser trained on the clamped source posterior. Thus adopting the new
+posterior requires cooperative Phase 1 retraining, after which diffusion
+remains frozen throughout alignment. The source mean-trajectory variance
+floor is a separate experimental constraint and remains configurable.
+
+Tests are written for outputs and KL gradients beyond the old bounds,
+posterior sampling scale, legacy and unclamped checkpoint restoration, and
+incompatible metadata. They are unrun by instruction; no training or
+typesetting was performed and no decoding improvement is claimed.
+
 \begin{thebibliography}{9}\small
 \bibitem{erdiff}
 Y. Wang, Z. Wu, C. Li, and A. Wu.

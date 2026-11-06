@@ -30,6 +30,23 @@ manifests must be regenerated for this objective. New manifests record the
 objective and installed POT version; incomplete or mismatched references fail
 validation. Use fresh output directories and compare fixed budgets/splits.
 
+New Phase 1 models default to `--posterior_logvar_mode unclamped`: the learned
+linear head returns log variance directly and sampling uses
+`z = mu + exp(0.5 * logvar) * eta`. The former bounds `[-5, 0]` are available
+as `--posterior_logvar_mode legacy_clamped` for controlled comparisons. The
+existing bias -3 / Xavier gain 0.1 initialization is retained; it is a local
+initialization choice and does not constrain the learned outputs.
+
+To use unclamped variance, retrain **both the source VAE and its diffusion
+model together in Phase 1**, then use that new checkpoint for Phase 2.
+Phase 2 always restores the source checkpoint's posterior setting and keeps
+the diffusion model frozen. Old checkpoints lacking posterior metadata
+retain the legacy clamp; loading them does not activate the new behavior.
+Both evaluators and synthetic checks follow the same checkpoint setting.
+Unclamped variance and the mean-trajectory variance floor are separate:
+the former controls uncertainty in `q(z|x)`, the latter opposes collapse of
+posterior means. Neither change establishes recovery of decoding performance.
+
 ---
 
 ## Project Structure

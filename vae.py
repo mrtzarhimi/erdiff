@@ -3,6 +3,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def posterior_configuration(logvar_mode="unclamped"):
+    """Serialize posterior semantics independently of identical state-dict shapes."""
+    if logvar_mode not in ("unclamped", "legacy_clamped"):
+        raise ValueError(f"Unknown posterior log-variance mode: {logvar_mode!r}")
+    return {
+        "logvar_mode": logvar_mode,
+        "minimum": -5.0 if logvar_mode == "legacy_clamped" else None,
+        "maximum": 0.0 if logvar_mode == "legacy_clamped" else None,
+    }
+
+
+def posterior_logvar_mode_from_checkpoint(checkpoint):
+    """Old source models keep the clamp their paired denoiser was trained with."""
+    config = checkpoint.get("posterior_config")
+    if "posterior_config" not in checkpoint:
+        if "posterior_logvar_mode" in checkpoint.get("training_config", {}):
+            raise ValueError("Checkpoint is missing its recorded posterior configuration.")
+        # Before this metadata existed, every production encoder clamped [-5, 0].
+        return "legacy_clamped"
+    if not isinstance(config, dict):
+        raise ValueError("Checkpoint posterior configuration must be a dictionary.")
+    mode = config.get("logvar_mode")
+    if config != posterior_configuration(mode):
+        raise ValueError("Checkpoint posterior configuration is incomplete or incompatible.")
+    training_mode = checkpoint.get("training_config", {}).get("posterior_logvar_mode")
+    if training_mode is not None and training_mode != mode:
+        raise ValueError("Checkpoint posterior mode disagrees with its training configuration.")
+    return mode
+
+
 def sample_latent_posterior(mu: torch.Tensor, logvar: torch.Tensor, noise=None):
     """Draw q(z|x) independently of dropout/training mode."""
     if noise is None:
@@ -17,8 +47,10 @@ class SequentialVAEEncoder(nn.Module):
         hidden_dim: int = 32,
         latent_dim: int = 8,
         dropout: float = 0.4,
+        posterior_logvar_mode: str = "unclamped",
     ):
         super().__init__()
+        self.posterior_config = posterior_configuration(posterior_logvar_mode)
         self.read_in = nn.Linear(n_neurons, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
         self.act = nn.ELU()
@@ -35,8 +67,8 @@ class SequentialVAEEncoder(nn.Module):
         self.fc_mu = nn.Linear(hidden_dim * 2, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim * 2, latent_dim)
 
-        # Fix Smoking Gun 2: Initialize logvar bias to -3.0 (initial std ~ 0.22)
-        # Prevents unit-variance white noise from destroying trajectories at epoch 1
+        # Retain the existing initialization (a local variant, not an output
+        # constraint). The learned head can move freely in unclamped mode.
         nn.init.constant_(self.fc_logvar.bias, -3.0)
         nn.init.xavier_uniform_(self.fc_logvar.weight, gain=0.1)
 
@@ -49,7 +81,9 @@ class SequentialVAEEncoder(nn.Module):
         rnn_out = self.dropout(rnn_out)
 
         mu = self.fc_mu(rnn_out)
-        logvar = torch.clamp(self.fc_logvar(rnn_out), min=-5.0, max=0.0)
+        logvar = self.fc_logvar(rnn_out)
+        if self.posterior_config["logvar_mode"] == "legacy_clamped":
+            logvar = torch.clamp(logvar, min=-5.0, max=0.0)
         return mu, logvar
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -108,9 +142,12 @@ class SequentialVAE(nn.Module):
         hidden_dim: int = 32,
         behavior_dim: int = 2,
         dropout: float = 0.4,
+        posterior_logvar_mode: str = "unclamped",
     ):
         super().__init__()
-        self.encoder = SequentialVAEEncoder(n_neurons, hidden_dim, latent_dim, dropout)
+        self.encoder = SequentialVAEEncoder(
+            n_neurons, hidden_dim, latent_dim, dropout, posterior_logvar_mode
+        )
         self.decoder = SequentialVAEDecoder(latent_dim, hidden_dim, n_neurons, dropout=0.3)
         self.behavior_decoder = RidgeBehaviorRegressor(latent_dim, behavior_dim, l2_alpha=0.1)
 

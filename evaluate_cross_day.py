@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from dataloader import denormalize_velocity, get_nhp_dataloaders
-from vae import SequentialVAE
+from vae import SequentialVAE, posterior_logvar_mode_from_checkpoint
 from decoder_models import compute_r2_score, compute_rmse
 from neuron_input_mapping import apply_mapping_to_loader, mapping_from_checkpoint
 
@@ -185,6 +185,7 @@ def main():
         latent_dim=latent_dim,
         hidden_dim=hidden_dim,
         behavior_dim=2,
+        posterior_logvar_mode=posterior_logvar_mode_from_checkpoint(src_ckpt),
     ).to(device)
 
     # Load frozen recurrent & behavior decoder weights from source

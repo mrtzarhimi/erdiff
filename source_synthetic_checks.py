@@ -22,7 +22,7 @@ from phase2_sampling import make_alignment_loader, source_sampling_generator
 from synthetic_shifts import apply_shift, make_shift, oracle_readin_weight, validation_development_split
 from train_phase2 import (build_source_gradient_calibration, clean_training_view,
                           extract_source_latent_bank, set_seed, train_epoch_phase2)
-from vae import SequentialVAE
+from vae import SequentialVAE, posterior_configuration, posterior_logvar_mode_from_checkpoint
 
 
 def fingerprint(path):
@@ -136,7 +136,10 @@ def main():
     validation_spikes = validation.dataset.spikes
     evaluation_velocity = validation.dataset.velocities[evaluation_offsets]
 
-    source = SequentialVAE(n_neurons, checkpoint["latent_dim"], checkpoint["hidden_dim"], 2).to(device)
+    posterior_mode = posterior_logvar_mode_from_checkpoint(checkpoint)
+    posterior_config = posterior_configuration(posterior_mode)
+    source = SequentialVAE(n_neurons, checkpoint["latent_dim"], checkpoint["hidden_dim"], 2,
+                           posterior_logvar_mode=posterior_mode).to(device)
     source.load_state_dict(checkpoint["vae_state_dict"])
     source.freeze_for_alignment()
     source.eval()
@@ -165,6 +168,7 @@ def main():
         calibration_path = Path(args.gradient_calibration_path or output / "source_gradient_calibration.json")
         calibration_provenance = {
             "transport": transport_config,
+            "posterior_config": posterior_config,
             "source_checkpoint_sha256": source_hash,
             "source_data_sha256": data_hash,
             "calibration_seed": args.gradient_calibration_seed,
@@ -229,6 +233,7 @@ def main():
         "probe_noise_namespace": "independent_mla_diagnostics_fixture",
         "alpha": args.alpha, "ot_epsilon": ot_epsilon,
         "transport": transport_config, "sinkhorn_iters": args.sinkhorn_iters,
+        "posterior_config": posterior_config,
         "gradient_balance": args.gradient_balance,
         "gradient_calibration": gradient_calibration,
         "gradient_calibration_path": str(calibration_path) if args.gradient_balance == "source_calibrated" else None,

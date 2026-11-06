@@ -180,6 +180,8 @@ def main():
                         help="Optional extra spike-noise variant; zero keeps only posterior/diffusion noise")
     parser.add_argument("--kl_weight", type=float, default=0.05, help="ELBO KL loss weight")
     parser.add_argument("--behavior_weight", type=float, default=2.0, help="Velocity MSE loss weight")
+    parser.add_argument("--posterior_logvar_mode", choices=("unclamped", "legacy_clamped"),
+                        default="unclamped", help="Learn raw log variance; legacy_clamped reproduces the old [-5, 0] bounds")
     parser.add_argument("--inspect_data_only", action="store_true", help="Report source trial and velocity-window diagnostics without training")
     args = parser.parse_args()
 
@@ -259,7 +261,9 @@ def main():
         hidden_dim=args.hidden_dim,
         behavior_dim=2,
         dropout=0.4,
+        posterior_logvar_mode=args.posterior_logvar_mode,
     ).to(device)
+    print(f"Posterior log variance: {args.posterior_logvar_mode}")
 
     diffusion_model = LatentDiffusionModel(
         seq_len=args.seq_len,
@@ -315,6 +319,7 @@ def main():
                     "epoch": epoch,
                     "training_seed": args.seed,
                     "training_config": vars(args).copy(),
+                    "posterior_config": dict(vae.encoder.posterior_config),
                     "code_revision": source_code_revision,
                     "source_data_fingerprint": source_data_provenance,
                     "vae_state_dict": vae.state_dict(),

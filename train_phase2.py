@@ -10,7 +10,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from dataloader import NHPDataset, get_nhp_dataloaders
-from vae import SequentialVAE, trajectory_smoothness_loss, sample_latent_posterior
+from vae import (SequentialVAE, trajectory_smoothness_loss, sample_latent_posterior,
+                 posterior_configuration, posterior_logvar_mode_from_checkpoint)
 from train_phase1 import evaluate_phase1
 from checkpoint_provenance import code_revision, file_fingerprint, file_sha256
 from phase2_freeze_guard import FrozenDiffusionGuard
@@ -649,6 +650,9 @@ def main():
     # 2. Restore Source Models from Phase 1
     latent_dim = checkpoint["latent_dim"]
     hidden_dim = checkpoint["hidden_dim"]
+    posterior_mode = posterior_logvar_mode_from_checkpoint(checkpoint)
+    posterior_config = posterior_configuration(posterior_mode)
+    print(f"Source checkpoint posterior log variance: {posterior_mode}")
     if args.ot_epsilon is None:
         args.ot_epsilon = 0.01
     transport_config = transport_configuration()
@@ -671,6 +675,7 @@ def main():
         "weight_decay": args.weight_decay,
         "alpha": args.alpha,
         "transport": transport_config,
+        "posterior_config": posterior_config,
         "ot_epsilon": args.ot_epsilon,
         "sinkhorn_iters": args.sinkhorn_iters,
         "smooth_weight": args.smooth_weight,
@@ -735,6 +740,7 @@ def main():
         latent_dim=latent_dim,
         hidden_dim=hidden_dim,
         behavior_dim=2,
+        posterior_logvar_mode=posterior_mode,
     ).to(device)
     vae.load_state_dict(checkpoint["vae_state_dict"])
     source_vae_for_calibration = copy.deepcopy(vae) if args.gradient_balance == "source_calibrated" else None
@@ -790,6 +796,7 @@ def main():
         sample_ids = clean_source_loader.dataset.trial_ids[:sample_count].tolist()
         fixture_recipe = {
             "transport": transport_config,
+            "posterior_config": posterior_config,
             "source_checkpoint_sha256": source_fingerprint,
             "source_data_sha256": data_fingerprints["source"]["sha256"],
             "sample_ids": sample_ids,
@@ -809,6 +816,7 @@ def main():
         ).hexdigest()
         calibration_provenance = {
             "transport": transport_config,
+            "posterior_config": posterior_config,
             "source_checkpoint_sha256": source_fingerprint,
             "source_data_sha256": data_fingerprints["source"]["sha256"],
             "alpha": args.alpha,
@@ -1159,6 +1167,7 @@ def main():
             "variance_pool_trials": len(clean_target_loader.dataset),
             "source_checkpoint_sha256": source_fingerprint,
             "source_checkpoint_path": os.path.realpath(args.source_checkpoint),
+            "posterior_config": posterior_config,
             "source_epoch": checkpoint.get("epoch"),
             "source_validation_r2": checkpoint.get("best_r2"),
             "source_self_check": args.source_self_check,
@@ -1184,6 +1193,7 @@ def main():
             "split_seed": target_data_metadata["split_seed"],
             "alignment_config": {
                 "transport": transport_config,
+                "posterior_config": posterior_config,
                 "alpha": args.alpha,
                 "ot_epsilon": args.ot_epsilon,
                 "sinkhorn_iters": args.sinkhorn_iters,
