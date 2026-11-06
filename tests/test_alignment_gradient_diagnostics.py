@@ -111,3 +111,13 @@ def test_saved_source_calibration_reuses_exact_factors_and_checks_provenance(tmp
     assert loaded["provenance"] == expected
     with pytest.raises(ValueError, match="provenance"):
         load_gradient_calibration(path, {**expected, "alpha": 0.4})
+
+
+def test_author_calibration_uses_sum_coefficients_even_when_legacy_alpha_is_zero():
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    result = calibrate_source_gradient_scale(
+        [{"mla": 2 * parameter, "ot": 10 * parameter}], (parameter,),
+        alpha=0.0, alignment_objective="author_2023",
+    )
+    assert result["valid"]
+    assert result["c_ot"] == pytest.approx(0.2)

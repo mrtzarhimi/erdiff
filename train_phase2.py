@@ -29,6 +29,9 @@ from diffusion import (
     VPSDEScheduler,
     total_alignment_loss,
     transport_configuration,
+    alignment_coefficients,
+    alignment_objective_configuration,
+    validate_alignment_source_loss,
 )
 from phase2_run_manifest import (
     build_run_manifest,
@@ -106,6 +109,7 @@ def build_source_gradient_calibration(
     vae, diffusion_model, scheduler, source_loader, source_latents_bank, device,
     *, alpha, ot_epsilon, sinkhorn_iters, probe_batches, seed, provenance,
     mla_variance_weight=0.0, mla_variance_floor=0.9, mla_variance_scope="batch",
+    alignment_objective="author_2023",
 ):
     """Measure fixed source-only loss gradients through an independent read-in copy."""
     if probe_batches < 1:
@@ -170,6 +174,8 @@ def build_source_gradient_calibration(
             return_components=True,
             mla_noise=diffusion_eps,
             mla_timesteps=times,
+            alignment_objective=alignment_objective,
+            mla_target=mu if alignment_objective == "author_2023" else None,
         )
         probe = {"mla": loss_mla, "ot": loss_ot}
         if mla_variance_weight > 0:
@@ -188,6 +194,7 @@ def build_source_gradient_calibration(
         raise ValueError("No source trials were available for gradient calibration.")
     result = calibrate_source_gradient_scale(
         probes, parameters, alpha=alpha, mla_variance_weight=mla_variance_weight,
+        alignment_objective=alignment_objective,
         metadata={**provenance, "sample_ids": sample_ids,
                   "probe_batches": len(probes), "calibration_dtype": str(parameters[0].dtype)},
     )
@@ -282,12 +289,14 @@ def train_epoch_phase2(
     source_noise_domain="source",
     numerical_failure_path=None,
     numerical_context=None,
+    alignment_objective="author_2023",
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
     """
     if gradient_balance not in ("none", "source_calibrated"):
         raise ValueError(f"Unknown gradient balance mode: {gradient_balance}")
+    mla_coefficient, ot_coefficient = alignment_coefficients(alignment_objective, alpha)
     if not torch.isfinite(torch.tensor(float(ot_scale))) or ot_scale <= 0:
         raise ValueError("OT gradient scale must be finite and positive.")
     vae.eval()                    # Disable dropout in encoder/decoder
@@ -297,6 +306,8 @@ def train_epoch_phase2(
     total_loss = 0.0
     total_mla = 0.0
     total_ot = 0.0
+    total_denoising = 0.0
+    total_skilling = 0.0
     total_smooth = 0.0
     total_variance_floor = 0.0
     total_variance_contribution = 0.0
@@ -368,7 +379,7 @@ def train_epoch_phase2(
         numerical_guard.check("source_posterior_sample", latent=z_source_batch)
 
         # 3. Compute paper MLA + regularized OT; smoothness is an optional variant.
-        loss_align, loss_mla, loss_ot = numerical_guard.call(
+        loss_align, loss_mla, loss_ot, loss_denoising, loss_skilling = numerical_guard.call(
             total_alignment_loss,
             diffusion_model=diffusion_model,
             scheduler=scheduler,
@@ -383,13 +394,18 @@ def train_epoch_phase2(
             mla_fixed_t=mla_fixed_t,
             mla_noise=mla_noise,
             mla_timesteps=mla_times,
+            alignment_objective=alignment_objective,
+            mla_target=mu_t if alignment_objective == "author_2023" else None,
+            return_mla_components=True,
         )
-        loss = (1.0 - alpha) * loss_mla + alpha * ot_scale * loss_ot
-        gradient_losses = {"mla": loss_mla, "ot": loss_ot}
-        gradient_coefficients = {"mla": 1.0 - alpha, "ot": alpha * ot_scale}
+        loss = mla_coefficient * loss_mla + ot_coefficient * ot_scale * loss_ot
+        gradient_losses = {"mla": loss_mla, "denoising": loss_denoising,
+                           "skilling": loss_skilling, "ot": loss_ot}
+        gradient_coefficients = {"mla": mla_coefficient, "denoising": mla_coefficient,
+                                 "skilling": mla_coefficient, "ot": ot_coefficient * ot_scale}
         variance_value = 0.0
         variance_contribution = 0.0
-        if mla_variance_weight > 0 and alpha < 1.0:
+        if mla_variance_weight > 0 and mla_coefficient > 0:
             from mla_stabilization import source_variance_floor_loss
             if source_variance is None:
                 raise ValueError("Variance stabilization requires a frozen source reference.")
@@ -406,10 +422,10 @@ def train_epoch_phase2(
                 loss_variance = source_variance_floor_loss(mu_t, source_variance, mla_variance_floor)
             else:
                 raise ValueError(f"Unknown variance scope: {mla_variance_scope}")
-            weighted_variance = (1.0 - alpha) * mla_variance_weight * loss_variance
+            weighted_variance = mla_coefficient * mla_variance_weight * loss_variance
             loss = loss + weighted_variance
             gradient_losses["variance"] = loss_variance
-            gradient_coefficients["variance"] = (1.0 - alpha) * mla_variance_weight
+            gradient_coefficients["variance"] = mla_coefficient * mla_variance_weight
             variance_value = loss_variance.item()
             variance_contribution = weighted_variance.item()
         smooth_value = 0.0
@@ -451,6 +467,8 @@ def train_epoch_phase2(
         total_loss += loss.item()
         total_mla += loss_mla.item()
         total_ot += loss_ot.item()
+        total_denoising += loss_denoising.item()
+        total_skilling += loss_skilling.item()
         total_smooth += smooth_value
         total_variance_floor += variance_value
         total_variance_contribution += variance_contribution
@@ -474,6 +492,8 @@ def train_epoch_phase2(
         "total": total_loss / batches,
         "mla": total_mla / batches,
         "ot": total_ot / batches,
+        "denoising": total_denoising / batches,
+        "skilling": total_skilling / batches,
         "smooth": total_smooth / batches,
         "variance_floor": total_variance_floor / batches,
         "variance_contribution": total_variance_contribution / batches,
@@ -529,7 +549,9 @@ def main():
                         help="Map target channels to source checkpoint input width before the read-in")
     parser.add_argument("--input_mapping_seed", type=int, default=42,
                         help="Seed for deterministic channel selection when target width exceeds source width")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off weighting Sinkhorn loss")
+    parser.add_argument("--alignment_objective", choices=("author_2023", "paper_squared"),
+                        default="author_2023", help="Author Smooth L1 + Skilling + OT, or previous squared-loss mixture")
+    parser.add_argument("--alpha", type=float, default=0.5, help="MLA/OT mixing weight only for paper_squared; ignored by author_2023")
     parser.add_argument("--ot_epsilon", type=float, default=None,
                         help="POT regularization on max-normalized trajectory costs; author default 0.01 (old 31.2 uses different units)")
     parser.add_argument("--sinkhorn_iters", type=int, default=1000, help="POT Sinkhorn-Knopp maximum iterations")
@@ -578,7 +600,7 @@ def main():
         raise ValueError("Gradient calibration batch count must be positive.")
     if not 0.0 <= args.alpha <= 1.0:
         raise ValueError("alpha must lie in [0, 1].")
-    if args.gradient_balance == "source_calibrated" and args.alpha in (0.0, 1.0):
+    if args.gradient_balance == "source_calibrated" and args.alignment_objective == "paper_squared" and args.alpha in (0.0, 1.0):
         raise ValueError("Source gradient balancing requires both MLA and OT to be active (0 < alpha < 1).")
     if args.noise_bank_replicates < 1:
         raise ValueError("Noise bank replicate count must be positive.")
@@ -609,6 +631,10 @@ def main():
         f"training seed: {checkpoint.get('training_seed', 'unknown')}"
     )
     noise_config = checkpoint.get("diffusion_training", {})
+    validate_alignment_source_loss(noise_config, args.alignment_objective)
+    objective_config = alignment_objective_configuration(args.alignment_objective)
+    mla_coefficient, ot_coefficient = alignment_coefficients(args.alignment_objective, args.alpha)
+    print(f"Alignment objective: {args.alignment_objective}; MLA coefficient={mla_coefficient:g}, OT coefficient={ot_coefficient:g}")
     if noise_config.get("latent_distribution") != "posterior_sample":
         raise ValueError(
             "Source diffusion checkpoint was not trained on posterior samples. "
@@ -700,6 +726,8 @@ def main():
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "alpha": args.alpha,
+        "alignment_objective": args.alignment_objective,
+        "alignment_objective_config": objective_config,
         "transport": transport_config,
         "posterior_config": posterior_config,
         "numerical_failure_policy": "abort_before_optimizer_step_v1",
@@ -822,6 +850,7 @@ def main():
                            args.gradient_calibration_batches * args.batch_size)
         sample_ids = clean_source_loader.dataset.trial_ids[:sample_count].tolist()
         fixture_recipe = {
+            "alignment_objective": objective_config,
             "transport": transport_config,
             "posterior_config": posterior_config,
             "source_checkpoint_sha256": source_fingerprint,
@@ -842,6 +871,7 @@ def main():
             json.dumps(fixture_recipe, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         calibration_provenance = {
+            "alignment_objective": objective_config,
             "transport": transport_config,
             "posterior_config": posterior_config,
             "source_checkpoint_sha256": source_fingerprint,
@@ -873,6 +903,7 @@ def main():
                 mla_variance_weight=args.mla_variance_weight,
                 mla_variance_floor=args.mla_variance_floor,
                 mla_variance_scope=args.mla_variance_scope,
+                alignment_objective=args.alignment_objective,
             )
             save_gradient_calibration(gradient_calibration_path, gradient_calibration)
             if not gradient_calibration["valid"]:
@@ -915,7 +946,7 @@ def main():
             f"padding={input_mapping.padding}, selected={input_mapping.kept_indices.numel()}"
         )
 
-    if args.mla_variance_weight > 0 and args.alpha < 1.0:
+    if args.mla_variance_weight > 0 and mla_coefficient > 0:
         from mla_stabilization import source_trial_variance
         source_variance = source_trial_variance(source_latents_bank.mu)
         variance_trials = len(clean_target_loader.dataset)
@@ -982,6 +1013,7 @@ def main():
                 "source_checkpoint": os.path.realpath(args.source_checkpoint),
                 "source_epoch": checkpoint.get("epoch"), "seed": args.seed, "split_seed": args.split_seed,
                 "alpha": args.alpha, "mla_t_min": args.mla_t_min,
+                "alignment_objective": args.alignment_objective,
                 "mla_t_max": args.mla_t_max, "mla_fixed_t": args.mla_fixed_t,
                 "mla_variance_weight": args.mla_variance_weight,
                 "mla_variance_floor": args.mla_variance_floor,
@@ -1023,6 +1055,7 @@ def main():
             source_sampling_rng=source_rng,
             target_noise_domain=target_noise_domain,
             source_noise_domain=source_noise_domain,
+            alignment_objective=args.alignment_objective,
             numerical_failure_path=os.path.join(args.save_dir, "phase2_numerical_failure.json"),
             numerical_context={
                 "epoch": epoch, "source_checkpoint_sha256": source_fingerprint,
@@ -1052,11 +1085,12 @@ def main():
                 f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
                 f"Alignment Loss: {align_metrics['total']:.4f} | "
                 f"MLA: {align_metrics['mla']:.4f} | OT: {align_metrics['ot']:.4f} | "
+                f"Denoising: {align_metrics['denoising']:.4f} | Skilling: {align_metrics['skilling']:.4f} | "
                 f"Smooth: {align_metrics['smooth']:.4f} | "
                 f"Var floor: {align_metrics['variance_floor']:.4f} "
                 f"(weighted {align_metrics['variance_contribution']:.4f}) | "
-                f"effective coefficients: MLA={1.0 - args.alpha:.4g}, "
-                f"OT={args.alpha * ot_scale:.4g} | "
+                f"effective coefficients: MLA={mla_coefficient:.4g}, "
+                f"OT={ot_coefficient * ot_scale:.4g} | "
                 f"Read-in grad: {align_metrics['grad_norm']:.4f} | "
                 f"Clipped: {align_metrics['clipped_steps']}/{align_metrics['updates']}"
             )
@@ -1225,6 +1259,8 @@ def main():
             "split_indices": target_data_metadata["split_indices"],
             "split_seed": target_data_metadata["split_seed"],
             "alignment_config": {
+                "alignment_objective": args.alignment_objective,
+                "alignment_objective_config": objective_config,
                 "transport": transport_config,
                 "posterior_config": posterior_config,
                 "alpha": args.alpha,

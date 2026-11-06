@@ -185,6 +185,7 @@ def build_phase2_flags(config, prefix=""):
         "seed": "--seed", "split_seed": "--split_seed", "epochs": "--epochs",
         "seq_len": "--seq_len", "batch_size": "--batch_size", "lr": "--lr",
         "alpha": "--alpha", "ot_epsilon": "--ot_epsilon",
+        "alignment_objective": "--alignment_objective",
         "mla_variance_weight": "--mla_variance_weight",
         "mla_variance_floor": "--mla_variance_floor",
         "mla_variance_scope": "--mla_variance_scope",
@@ -239,9 +240,15 @@ def main():
     reference = load_reference(args.reference_run)
     # Every protocol, including the synthetic launcher, must reject a reference
     # from the former objective rather than silently relabeling it as a replay.
-    from diffusion import transport_configuration
+    from diffusion import transport_configuration, alignment_objective_configuration
     if reference["resolved_config"].get("transport") != transport_configuration():
         raise ValueError("Reference transport objective or POT version differs; generate a new reference run.")
+    objective = reference["resolved_config"].get("alignment_objective")
+    if objective not in ("author_2023", "paper_squared") or (
+        reference["resolved_config"].get("alignment_objective_config")
+        != alignment_objective_configuration(objective)
+    ):
+        raise ValueError("Reference lacks a matching explicit alignment-loss configuration; generate a new reference run.")
     resolved = resolve_case_config(reference, args.protocol, args.case)
     if args.protocol == "synthetic" and resolved["resolved_config"].get("augment_target"):
         raise ValueError("Source-synthetic cases require unique clean adaptation trials; target augmentation is unsupported.")
@@ -285,6 +292,7 @@ def main():
                        "--mla_variance_scope", str(config.get("mla_variance_scope", "full_train")),
                        "--seed", "42", "--split_seed", "42", "--shift_seed", "42",
                        "--alpha", str(config.get("alpha", 0.0)), "--ot_epsilon", str(config.get("ot_epsilon", 0.01)),
+                       "--alignment_objective", str(config.get("alignment_objective", "author_2023")),
                        "--sinkhorn_iters", str(config.get("sinkhorn_iters", 1000)),
                        "--smooth_weight", str(config.get("smooth_weight", 0.0)),
                        "--gradient_balance", str(config.get("gradient_balance", "none")),
@@ -334,6 +342,7 @@ def main():
                "--phase2_sinkhorn_iters", str(config.get("sinkhorn_iters", 1000)),
                "--phase2_gradient_calibration_batches", str(config.get("gradient_calibration_batches", 3)),
                "--phase2_alpha", str(config.get("alpha", 0.5)),
+               "--phase2_alignment_objective", str(config.get("alignment_objective", "author_2023")),
                "--phase2_mla_variance_weight", str(config.get("mla_variance_weight", 10.0)),
                "--phase2_mla_variance_floor", str(config.get("mla_variance_floor", 0.9)),
                "--phase2_mla_variance_scope", str(config.get("mla_variance_scope", "full_train")),

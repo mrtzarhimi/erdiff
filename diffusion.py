@@ -269,19 +269,68 @@ def mla_loss(
     fixed_time=None,
     noise=None,
     timesteps=None,
+    alignment_objective="author_2023",
+    return_components=False,
 ) -> torch.Tensor:
     """
-    Phase 2: Maximum Likelihood Alignment (MLA) Loss (Equation 12 & Equation 26).
+    Phase 2 MLA for the selected author-code or paper-squared loss mode.
     The diffusion model is FROZEN. The gradient flows back through z_t into z_0_target (and the encoder).
     """
     batch_size = z_0_target.size(0)
     t = timesteps if timesteps is not None else scheduler.sample_timesteps(batch_size, z_0_target.device, time_min, time_max, fixed_time)
     eps = noise if noise is not None else torch.randn_like(z_0_target)
 
-    return fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps)
+    return fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps,
+                                alignment_objective, return_components)
 
 
-def fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps):
+def alignment_coefficients(alignment_objective, alpha):
+    if not 0 <= alpha <= 1:
+        raise ValueError("alpha must be in [0, 1].")
+    if alignment_objective == "author_2023":
+        return 1.0, 1.0
+    if alignment_objective == "paper_squared":
+        return 1.0 - alpha, alpha
+    raise ValueError(f"Unknown alignment objective: {alignment_objective!r}")
+
+
+def alignment_objective_configuration(alignment_objective):
+    alignment_coefficients(alignment_objective, 0.5)
+    return {
+        "name": alignment_objective,
+        "residual": "1.2_element_mean_smooth_l1_beta1" if alignment_objective == "author_2023" else "trajectory_sum_squared_batch_mean",
+        "mla_latent": "posterior_mean" if alignment_objective == "author_2023" else "posterior_sample",
+        "ot_latent": "posterior_sample",
+        "combination": "mla_plus_ot_plus_skilling" if alignment_objective == "author_2023" else "alpha_mixture",
+        "skilling_scale": 1 / 50 if alignment_objective == "author_2023" else 0.0,
+        "schedule": "existing_continuous_VP_not_author_discrete_schedule",
+    }
+
+
+def validate_alignment_source_loss(diffusion_training, alignment_objective):
+    if alignment_objective == "author_2023" and (
+        diffusion_training.get("denoising_loss") != "l1"
+        or diffusion_training.get("denoising_reduction") != "element_mean"
+    ):
+        raise ValueError("Author alignment requires an element-mean L1 denoiser; retrain Phase 1 with --diffusion_loss l1.")
+
+
+def skilling_divergence(z_noisy, scheduler, t):
+    """Author ERDiff_utils.py:31-35 evaluated on our linear forward marginal.
+
+    For z_t=a_t*z_0+sigma_t*eps, its all-ones VJP wrt z_0 is a_t.
+    The author uses create_graph=False, reproduced by detaching a_t. The
+    literal 1/50 factor is preserved; this is not VP drift divergence.
+    """
+    signal, _ = scheduler.marginal_params(t)
+    vjp = signal.detach().reshape((-1,) + (1,) * (z_noisy.ndim - 1))
+    value = (z_noisy * vjp * (1 / 50)).mean()
+    require_finite("skilling_divergence", loss=value)
+    return value
+
+
+def fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps,
+                         alignment_objective="author_2023", return_components=False):
     """The production MLA objective with explicit timesteps and Gaussian noise."""
     require_finite("mla_inputs", latent=z_0_target, timesteps=t, noise=eps)
     # Differentiable forward diffusion of target latents
@@ -292,12 +341,16 @@ def fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps):
     eps_pred = diffusion_model(z_t, t)
     require_finite("mla_denoiser_output", predicted_noise=eps_pred)
 
-    # Eq. 26 uses a squared norm over each complete latent trajectory.
-    # Unit w(t)^2 is used here; the paper leaves its weighting choice open.
-    # The VP drift-divergence term is constant with respect to the read-in.
-    residual_loss = (eps - eps_pred).square().flatten(start_dim=1).sum(dim=1).mean()
+    alignment_coefficients(alignment_objective, 0.5)  # validate mode
+    if alignment_objective == "author_2023":
+        residual_loss = 1.2 * F.smooth_l1_loss(eps_pred, eps, beta=1.0, reduction="mean")
+        loss_skilling = skilling_divergence(z_t, scheduler, t)
+    else:
+        residual_loss = (eps - eps_pred).square().flatten(start_dim=1).sum(dim=1).mean()
+        loss_skilling = residual_loss.new_zeros(())
     require_finite("mla_residual_loss", loss=residual_loss)
-    return residual_loss
+    total = residual_loss + loss_skilling
+    return (total, residual_loss, loss_skilling) if return_components else total
 
 
 def transport_configuration():
@@ -370,17 +423,27 @@ def total_alignment_loss(
     mla_fixed_t=None,
     mla_noise=None,
     mla_timesteps=None,
+    alignment_objective="author_2023",
+    mla_target=None,
+    return_mla_components=False,
 ) -> torch.Tensor:
     """
-    Total Phase 2 Alignment Loss:
-      L = (1 - alpha) * L_MLA + alpha * L_SHD
+    Author sum or legacy paper-squared mixture. Caller supplies posterior
+    means for author MLA separately from the posterior samples used for OT.
     """
     if not 0.0 <= alpha <= 1.0:
         raise ValueError("alpha must be between 0 and 1 for the paper's loss mixture.")
-    loss_mla = mla_loss(diffusion_model, scheduler, z_target, mla_t_min, mla_t_max,
-                        mla_fixed_t, mla_noise, mla_timesteps)
+    mla_coefficient, ot_coefficient = alignment_coefficients(alignment_objective, alpha)
+    if alignment_objective == "author_2023" and mla_target is None:
+        raise ValueError("Author alignment requires explicit posterior means in mla_target.")
+    latent = z_target if mla_target is None else mla_target
+    loss_mla, loss_denoising, loss_skilling = mla_loss(
+        diffusion_model, scheduler, latent, mla_t_min, mla_t_max,
+        mla_fixed_t, mla_noise, mla_timesteps, alignment_objective, True)
     loss_shd = sinkhorn_loss(z_source, z_target, epsilon=ot_epsilon, num_iters=sinkhorn_iters)
-    total = (1.0 - alpha) * loss_mla + alpha * loss_shd
+    total = mla_coefficient * loss_mla + ot_coefficient * loss_shd
+    if return_mla_components:
+        return total, loss_mla, loss_shd, loss_denoising, loss_skilling
     if return_components:
         return total, loss_mla, loss_shd
     return total

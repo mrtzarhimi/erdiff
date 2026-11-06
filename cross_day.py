@@ -123,7 +123,8 @@ def main():
     parser.add_argument("--phase2_augment_mult", type=int, default=3)
     parser.add_argument("--phase2_sinkhorn_iters", type=int, default=1000)
     parser.add_argument("--phase2_gradient_calibration_batches", type=int, default=3)
-    parser.add_argument("--phase2_alpha", type=float, default=0.5, help="Paper MLA/transport mixing weight")
+    parser.add_argument("--phase2_alignment_objective", choices=("author_2023", "paper_squared"), default="author_2023")
+    parser.add_argument("--phase2_alpha", type=float, default=0.5, help="MLA/OT mixture only for paper_squared; author mode uses a sum")
     parser.add_argument("--phase2_ot_epsilon", type=float, default=None, help="POT normalized-cost regularization; default 0.01")
     parser.add_argument("--phase2_smooth_weight", type=float, default=0.0, help="Optional smoothness variant")
     parser.add_argument("--phase2_mla_variance_weight", type=float, default=0.0, help="Optional MLA source-variance constraint")
@@ -253,6 +254,7 @@ def main():
             "--epochs", str(args.phase2_epochs),
             "--augment_mult", str(args.phase2_augment_mult),
             "--alpha", str(args.phase2_alpha),
+            "--alignment_objective", args.phase2_alignment_objective,
             "--smooth_weight", str(args.phase2_smooth_weight),
             "--mla_variance_weight", str(args.phase2_mla_variance_weight),
             "--mla_variance_floor", str(args.phase2_mla_variance_floor),

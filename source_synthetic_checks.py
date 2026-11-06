@@ -12,7 +12,8 @@ import torch
 
 from dataloader import NHPDataset, denormalize_velocity, get_nhp_dataloaders
 from decoder_models import compute_r2_score, compute_rmse
-from diffusion import LatentDiffusionModel, VPSDEScheduler, transport_configuration
+from diffusion import (LatentDiffusionModel, VPSDEScheduler, transport_configuration,
+                       alignment_objective_configuration, validate_alignment_source_loss)
 from mla_diagnostics import MLADiagnostics, variance_summary
 from mla_stabilization import source_trial_variance
 from alignment_noise_bank import AlignmentNoiseBank
@@ -83,8 +84,9 @@ def main():
     parser.add_argument("--noise_bank_path", default=None)
     parser.add_argument("--match_input_size", action="store_true")
     parser.add_argument("--input_mapping_seed", type=int, default=42)
+    parser.add_argument("--alignment_objective", choices=("author_2023", "paper_squared"), default="author_2023")
     parser.add_argument("--alpha", type=float, default=0.0,
-                        help="MLA/OT mixture; default 0 retains historical MLA-only synthetic checks")
+                        help="MLA/OT mixture only for paper_squared; ignored by author_2023")
     parser.add_argument("--ot_epsilon", type=float, default=None)
     parser.add_argument("--sinkhorn_iters", type=int, default=1000)
     parser.add_argument("--smooth_weight", type=float, default=0.0)
@@ -117,6 +119,9 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(args.source_checkpoint, map_location="cpu")
+    validate_alignment_source_loss(checkpoint.get("diffusion_training", {}), args.alignment_objective)
+    objective_config = alignment_objective_configuration(args.alignment_objective)
+    print(f"Alignment objective: {args.alignment_objective} (author mode ignores alpha)")
     if checkpoint.get("diffusion_training", {}).get("latent_distribution") != "posterior_sample":
         raise ValueError("These checks require the posterior-sample source diffusion checkpoint.")
     if checkpoint.get("split_seed") != args.split_seed:
@@ -167,6 +172,7 @@ def main():
     if args.gradient_balance == "source_calibrated":
         calibration_path = Path(args.gradient_calibration_path or output / "source_gradient_calibration.json")
         calibration_provenance = {
+            "alignment_objective": objective_config,
             "transport": transport_config,
             "posterior_config": posterior_config,
             "source_checkpoint_sha256": source_hash,
@@ -194,6 +200,7 @@ def main():
                 seed=args.gradient_calibration_seed, provenance=calibration_provenance,
                 mla_variance_weight=args.weights[0], mla_variance_floor=args.mla_variance_floor,
                 mla_variance_scope=args.mla_variance_scope,
+                alignment_objective=args.alignment_objective,
             )
             from alignment_gradient_diagnostics import save_gradient_calibration
             save_gradient_calibration(str(calibration_path), gradient_calibration)
@@ -232,6 +239,8 @@ def main():
         "noise_bank_path": noise_bank_path if noise_bank is not None else None,
         "probe_noise_namespace": "independent_mla_diagnostics_fixture",
         "alpha": args.alpha, "ot_epsilon": ot_epsilon,
+        "alignment_objective": args.alignment_objective,
+        "alignment_objective_config": objective_config,
         "transport": transport_config, "sinkhorn_iters": args.sinkhorn_iters,
         "posterior_config": posterior_config,
         "gradient_balance": args.gradient_balance,
@@ -313,6 +322,7 @@ def main():
                     dataset, validation_ids[adaptation_offsets], checkpoint["latent_dim"],
                     probe_times, args.seed, 16, str(run_dir),
                     context={"shift": kind, "variance_weight": weight, "scope": args.mla_variance_scope,
+                             "alignment_objective": args.alignment_objective,
                              "seed": args.seed, "split_seed": args.split_seed, "shift_seed": args.shift_seed,
                              "alignment_noise_mode": args.alignment_noise_mode,
                              "noise_seed": args.noise_seed,
@@ -340,6 +350,7 @@ def main():
                     target_noise_domain=target_noise_domains[kind],
                     source_noise_domain=source_noise_domain,
                     numerical_failure_path=run_dir / "phase2_numerical_failure.json",
+                    alignment_objective=args.alignment_objective,
                     numerical_context={"epoch": epoch, "shift": kind, "variance_weight": weight,
                                        "seed": args.seed, "split_seed": args.split_seed},
                 )

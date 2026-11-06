@@ -66,15 +66,20 @@ def calibrate_source_gradient_scale(
     inactive_threshold=1e-12,
     mla_variance_weight=0.0,
     metadata=None,
+    alignment_objective="paper_squared",
 ):
     """Calibrate the OT multiplier from fixed source-only MLA/OT loss probes.
 
     The ratio uses RMS *weighted* gradient norms of the complete MLA branch,
-    ``(1-alpha)||g_(MLA + lambda V)||``, and OT, ``alpha||g_OT||``. If a
+    using mode-specific coefficients: (1-alpha, alpha) in paper_squared
+    and (1, 1) in author_2023. The MLA branch includes Skilling in author
+    mode and the configured variance penalty in either mode. If a
     variance loss is supplied, it participates only through its configured
     coefficient; ``c_ot`` never scales the variance term separately.
     """
-    if not 0.0 < alpha < 1.0:
+    from diffusion import alignment_coefficients
+    mla_coefficient, ot_coefficient = alignment_coefficients(alignment_objective, alpha)
+    if not mla_coefficient > 0 or not ot_coefficient > 0:
         return {"valid": False, "reason": "alpha_must_mix_both_components",
                 "c_mla": 1.0, "c_ot": None, "metadata": metadata or {}}
     if minimum <= 0 or maximum < minimum or inactive_threshold <= 0:
@@ -89,7 +94,7 @@ def calibrate_source_gradient_scale(
         mla_branch = losses["mla"] + mla_variance_weight * losses.get("variance", losses["mla"] * 0.0)
         report = component_gradient_report(
             {"mla": mla_branch, "ot": losses["ot"]}, parameters,
-            {"mla": 1.0 - alpha, "ot": alpha},
+            {"mla": mla_coefficient, "ot": ot_coefficient},
         )
         mla_norm = report["components"]["mla"]["norm"]
         ot_norm = report["components"]["ot"]["norm"]

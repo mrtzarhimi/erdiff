@@ -60,6 +60,7 @@ class MLADiagnostics:
         self.diffusion_noise = torch.randn(shape, generator=generator)
         self.times = times
         self.context = {} if context is None else context
+        self.alignment_objective = self.context.get("alignment_objective", "author_2023")
         self.baseline = None
         self.path = os.path.join(save_dir, "mla_diagnostics.jsonl")
         with open(self.path, "w"):
@@ -100,18 +101,27 @@ class MLADiagnostics:
     def gradient_probe(self, time, vae, denoiser, scheduler, device):
         with torch.enable_grad():
             mu, logvar = vae.encoder(self.spikes.to(device))
-            z0 = sample_latent_posterior(mu, logvar, self.posterior_noise.to(device))
+            z0 = (mu if self.alignment_objective == "author_2023" else
+                  sample_latent_posterior(mu, logvar, self.posterior_noise.to(device)))
             eps = self.diffusion_noise.to(device)
             t = z0.new_full((z0.size(0),), time)
-            loss = fixed_noise_mla_loss(denoiser, scheduler, z0, t, eps)
+            loss, residual, skilling = fixed_noise_mla_loss(
+                denoiser, scheduler, z0, t, eps, self.alignment_objective, True)
             parameters = tuple(vae.encoder.read_in.parameters())
-            gradients = torch.autograd.grad(loss, (z0, mu, logvar) + parameters)
+            variables = ((mu, logvar) if z0 is mu else (z0, mu, logvar)) + parameters
+            raw_gradients = torch.autograd.grad(loss, variables, allow_unused=True)
+            gradients = tuple(torch.zeros_like(variable) if gradient is None else gradient
+                              for variable, gradient in zip(variables, raw_gradients))
+            if z0 is mu:
+                gradients = (gradients[0],) + gradients
         gz, gmu, glogvar = (g.detach() for g in gradients[:3])
         direction = eps / eps.norm().clamp_min(1e-12)
         step = 1e-3 * max(1.0, z0.detach().square().mean().sqrt().item())
         with torch.no_grad():
-            plus = fixed_noise_mla_loss(denoiser, scheduler, z0.detach() + step * direction, t, eps)
-            minus = fixed_noise_mla_loss(denoiser, scheduler, z0.detach() - step * direction, t, eps)
+            plus = fixed_noise_mla_loss(denoiser, scheduler, z0.detach() + step * direction, t, eps,
+                                        self.alignment_objective)
+            minus = fixed_noise_mla_loss(denoiser, scheduler, z0.detach() - step * direction, t, eps,
+                                         self.alignment_objective)
             numeric = ((plus - minus) / (2 * step)).item()
             analytic = (gz * direction).sum().item()
             a, std = scheduler.marginal_params(t[:1])
@@ -120,6 +130,7 @@ class MLADiagnostics:
             "time": time, "signal_coefficient": a.item(), "diffusion_std": std.item(),
             "signal_noise_power_ratio": (a.square() / std.square().clamp_min(1e-12)).item(),
             "loss": loss.item(), "latent_grad_norm": gz.norm().item(),
+            "denoising_loss": residual.item(), "skilling_loss": skilling.item(),
             "mu_grad_norm": gmu.norm().item(), "logvar_grad_norm": glogvar.norm().item(),
             "logvar_grad_sum": glogvar.sum().item(),
             "mu_radial_dot": (gmu * centered_mu).sum().item(),

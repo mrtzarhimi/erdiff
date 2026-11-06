@@ -42,7 +42,8 @@ def test_mla_uses_explicit_fixed_bank_noise_and_times_without_global_draws():
     expected = (explicit_noise - 0.25 * noisy).square().flatten(start_dim=1).sum(dim=1).mean()
 
     value = mla_loss(
-        ScaledDenoiser(), scheduler, z0, noise=explicit_noise, timesteps=explicit_times
+        ScaledDenoiser(), scheduler, z0, noise=explicit_noise, timesteps=explicit_times,
+        alignment_objective="paper_squared",
     )
     value.backward()
 

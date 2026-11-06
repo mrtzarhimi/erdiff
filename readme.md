@@ -71,6 +71,32 @@ existing diffusion weights trained with MSE do not become L1-trained weights.
 Posterior sampling, the continuous VP schedule and model architecture remain
 separate local choices; this loss correction alone is not full reproduction.
 
+Phase 2 now defaults to `--alignment_objective author_2023` (cross-day:
+`--phase2_alignment_objective author_2023`). Its reference loss is
+`1.2 * mean(SmoothL1(eps_pred, eps, beta=1)) + OT + skilling_divergence`.
+MLA uses posterior means; OT retains sampled source/target posteriors, as in
+the author alignment code. `--alpha` applies only to the legacy
+`--alignment_objective paper_squared` mode. Author mode uses coefficients 1
+for its complete MLA branch and OT; the 1.2 residual coefficient is already
+inside that MLA branch. Logs expose denoising and Skilling separately.
+
+The historical helper computes `mean(z_noisy * VJP(z_noisy, z0, ones) / 50)`.
+For our linear VP forward marginal its VJP equals the detached signal
+coefficient, which we use directly with the same value/gradient. This is the
+author helper, not the paper's VP drift-divergence formula. We retain our
+continuous VP schedule; the author uses a 50-step discrete schedule, so the
+port remains a documented loss variant on our existing schedule.
+
+Author mode requires a newly trained element-mean L1 source checkpoint and
+rejects old or unspecified diffusion loss metadata. Use fresh output folders
+and source calibration artifacts. For the reference **loss** comparison,
+set gradient balancing to `none`, smoothness to `0`, and variance weight to
+`0`. Keeping them enabled is supported and explicitly changes the objective:
+`MLA + variance_weight*V + c_OT*OT + smooth_weight*S` in author mode. Previous
+weights were assessed with a trajectory-sum squared MLA loss and need
+source-only reassessment at this new scale. Fixed Gaussian banks, input-size
+mapping, saved splits, final-epoch evaluation and frozen diffusion are retained.
+
 ---
 
 ## Project Structure

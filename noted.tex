@@ -579,6 +579,67 @@ are retained and still differ from parts of the historical author pipeline.
 Hand-derived value/gradient and duplicate-trial reduction checks are written
 but unrun.
 
+\section{Porting the historical alignment loss}
+
+The pinned \path{MLA.py}, lines 221--237, adds three terms without the
+paper's $\alpha$ mixture:
+\begin{equation}
+ L_{\mathrm{author}}=
+ 1.2\,\frac{1}{BLd}\sum_{b,\ell,j}
+ h_1(\widehat\epsilon_{b\ell j}-\epsilon_{b\ell j})
+ + L_{\mathrm{OT}}+D_{\mathrm{code}},\qquad
+ h_1(r)=\begin{cases}r^2/2,&|r|<1,\\|r|-1/2,&|r|\geq1.\end{cases}
+\end{equation}
+The new \texttt{author\_2023} alignment mode uses posterior means for the
+noised MLA trajectories and posterior samples for OT, following the return
+value and internal sampling in \path{model_functions/MLA_Model.py}.
+The previous trajectory-sum squared residual and $\alpha$ mixture remain
+available as \texttt{paper\_squared}; that name does not certify the full
+paper pipeline. The denoising term and additional term are logged separately.
+
+\path{model_functions/ERDiff_utils.py}, lines 31--35, defines
+\begin{equation}
+ D_{\mathrm{code}}=\operatorname{mean}\!\left[
+ Z_t\odot\operatorname{VJP}_{Z_0}(Z_t;\mathbf 1)/50\right].
+\end{equation}
+For the linear noising map $Z_t=a_tZ_0+\sigma_t\epsilon$, the VJP is $a_t$.
+The author's call does not request a derivative graph for that VJP, so we
+use detached $a_t$ analytically. This works during both gradient checks and
+no-grad finite-difference evaluations without nested recurrent backward
+passes. On matched tensors and coefficients it gives the same value and
+gradient as the literal helper. In particular,
+\begin{equation}
+ \frac{\partial D_{\mathrm{code}}}{\partial Z_{0,b\ell j}}
+ = \frac{a_{t_b}^2}{50BLd}.
+\end{equation}
+This nonzero gradient is not the constant VP drift-divergence contribution
+in the paper derivation. It can shift latent offsets and is reproduced as
+an author-code choice, not asserted to improve decoding.
+
+The literal $1/50$ scale is retained, while our continuous VP marginals and
+uniform continuous timestep sampling remain unchanged. The author snapshot
+uses a quadratic discrete 50-step schedule and trains diffusion on source
+means; our density training still uses source posterior samples. Thus this
+is a loss port with explicit remaining differences, not an exact historical
+reproduction. Denoiser architecture, preprocessing, optimization and fair
+evaluation partitions remain independently documented choices.
+
+The author mode requires an L1-trained source checkpoint and records its
+loss configuration in run and calibration provenance. Optional variance,
+smoothness and gradient balancing stay configurable; in this mode the
+complete objective is $L_{\mathrm{MLA}}+\lambda_VV+c_{\mathrm{OT}}L_{\mathrm{OT}}
++\lambda_SS$. Reference-loss checks use $\lambda_V=\lambda_S=0$ and
+$c_{\mathrm{OT}}=1$. Source-only calibration includes the Skilling gradient
+and uses the actual sum coefficients. Old calibration files are rejected.
+Existing hyperparameters need source-only reassessment because an element
+mean and a trajectory sum differ substantially in scale, in addition to the
+change from squared residuals to Smooth L1.
+
+Written checks cover hand-derived reductions, literal VJP parity, retained
+legacy behavior, source-checkpoint compatibility and read-in gradients
+through a frozen denoiser. No tests or training were executed; no performance
+improvement or full reproduction is claimed.
+
 \begin{thebibliography}{9}\small
 \bibitem{erdiff}
 Y. Wang, Z. Wu, C. Li, and A. Wu.
