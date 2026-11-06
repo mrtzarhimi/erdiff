@@ -40,20 +40,23 @@ def test_vp_forward_noise_matches_constant_beta_marginal():
     assert torch.equal(returned_noise, noise)
 
 
-def test_transport_uses_full_squared_trajectory_cost_and_gradient():
+def test_transport_normalizes_cost_including_its_gradient():
     source = torch.tensor([[[0.0, 0.0]]])
     target = torch.tensor([[[2.0, 0.0]]], requires_grad=True)
     loss = sinkhorn_loss(source, target, epsilon=0.1)
     gradient = torch.autograd.grad(loss, target)[0]
 
-    assert torch.allclose(loss, torch.tensor(4.0))
-    assert torch.allclose(gradient, torch.tensor([[[4.0, 0.0]]]))
+    # A singleton transport has normalized cost C/C = 1 at every nonzero C.
+    assert torch.allclose(loss, torch.tensor(1.0))
+    assert torch.allclose(gradient, torch.zeros_like(target), atol=1e-6)
 
 
-def test_transport_value_includes_entropy_term():
+def test_identical_trajectories_use_author_offset_without_entropy_in_return():
     source = torch.zeros(2, 1, 1)
     target = torch.zeros(2, 1, 1)
 
     loss = sinkhorn_loss(source, target, epsilon=2.0)
 
-    assert torch.allclose(loss, torch.tensor(-2.0 * math.log(4)), atol=1e-6)
+    # The author adds 1e-4 before normalization: every entry is 1 here.
+    # sinkhorn2 returns <gamma, C>, so no negative entropy is added.
+    assert torch.allclose(loss, torch.tensor(1.0), atol=1e-6)

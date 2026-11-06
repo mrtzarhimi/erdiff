@@ -1,0 +1,4 @@
+# Added dependency for the author-code ot.sinkhorn2 objective.
+# The 2023 author requirements did not pin a POT version. Runs record the
+# installed version; this range is a local compatibility choice, not that pin.
+POT>=0.9,<0.10

@@ -447,6 +447,36 @@ Settings must be frozen before later source-test or real-target confirmation.
 Neither the synthetic checks nor the full-pool implementation tests have
 been executed during this implementation; no new result is asserted.
 
+\section{Restoring the historical author transport objective}
+
+The pinned 2023 author implementation, \path{model_functions/MLA_Model.py},
+lines 190--195, forms squared distances between flattened sampled latent
+trajectories and calls POT's \texttt{sinkhorn2}. To reproduce that behavior,
+we now compute
+\begin{align}
+ C_{ij} &= \lVert z_i^s-z_j^t\rVert_2^2+10^{-4},
+ & \bar C &= C/\max_{ij}C_{ij},\\
+ \gamma_\varepsilon &\in \arg\min_{\gamma\in\Pi(a,b)}
+ \langle\gamma,\bar C\rangle+
+ \varepsilon\sum_{ij}\gamma_{ij}\log\gamma_{ij},
+ & L_{\mathrm{OT}} &= \langle\gamma_\varepsilon,\bar C\rangle.
+\end{align}
+The masses $a$ and $b$ are uniform over each domain's batch; their batch
+sizes may differ. The author default is $\varepsilon=0.01$. The local maximum
+iteration default is now 1000, with Sinkhorn--Knopp and tolerance $10^{-9}$.
+POT's installed version is recorded because the historical requirements
+did not pin it.
+
+This returned value excludes the entropy contribution, whereas the paper's
+written objective includes it. We explicitly choose author-code fidelity
+for this change. Autograd now traverses both the transport solver and
+the maximum normalization. In particular, a detached-plan envelope gradient
+for the entropy-inclusive value would not be equivalent to this gradient.
+The previous unnormalized-cost setting $31.2$ is not the regularization
+setting for this normalized objective. Old calibration files and controlled
+references must be regenerated. No performance gain is established by this
+change; the value, gradient and finite-difference tests are written but unrun.
+
 \begin{thebibliography}{9}\small
 \bibitem{erdiff}
 Y. Wang, Z. Wu, C. Li, and A. Wu.

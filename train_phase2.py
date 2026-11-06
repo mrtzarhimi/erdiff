@@ -26,6 +26,7 @@ from diffusion import (
     LatentDiffusionModel,
     VPSDEScheduler,
     total_alignment_loss,
+    transport_configuration,
 )
 from phase2_run_manifest import (
     build_run_manifest,
@@ -258,8 +259,8 @@ def train_epoch_phase2(
     optimizer: optim.Optimizer,
     device: torch.device,
     alpha: float = 0.5,
-    ot_epsilon: float = 0.1,
-    sinkhorn_iters: int = 100,
+    ot_epsilon: float = 0.01,
+    sinkhorn_iters: int = 1000,
     smooth_weight: float = 0.0,
     mla_t_min=None,
     mla_t_max=None,
@@ -503,8 +504,8 @@ def main():
                         help="Seed for deterministic channel selection when target width exceeds source width")
     parser.add_argument("--alpha", type=float, default=0.5, help="Trade-off weighting Sinkhorn loss")
     parser.add_argument("--ot_epsilon", type=float, default=None,
-                        help="Entropy weight for full-trajectory transport; default preserves the former per-element temperature")
-    parser.add_argument("--sinkhorn_iters", type=int, default=100, help="Log-domain transport scaling iterations")
+                        help="POT regularization on max-normalized trajectory costs; author default 0.01 (old 31.2 uses different units)")
+    parser.add_argument("--sinkhorn_iters", type=int, default=1000, help="POT Sinkhorn-Knopp maximum iterations")
     parser.add_argument("--smooth_weight", type=float, default=0.0, help="Optional trajectory-smoothness variant; paper default is zero")
     parser.add_argument("--mla_diagnostics", action="store_true", help="Source-only variance and fixed-noise gradient probes")
     parser.add_argument("--mla_diagnostics_only", action="store_true", help="Record initial probes and exit without optimizer updates")
@@ -649,8 +650,9 @@ def main():
     latent_dim = checkpoint["latent_dim"]
     hidden_dim = checkpoint["hidden_dim"]
     if args.ot_epsilon is None:
-        args.ot_epsilon = 0.1 * args.seq_len * latent_dim
-    print(f"Transport entropy weight: {args.ot_epsilon:g}")
+        args.ot_epsilon = 0.01
+    transport_config = transport_configuration()
+    print(f"Transport: author sinkhorn2 | normalized-cost regularization: {args.ot_epsilon:g}")
 
     runtime_config = {
         "seed": args.seed,
@@ -668,6 +670,7 @@ def main():
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "alpha": args.alpha,
+        "transport": transport_config,
         "ot_epsilon": args.ot_epsilon,
         "sinkhorn_iters": args.sinkhorn_iters,
         "smooth_weight": args.smooth_weight,
@@ -786,6 +789,7 @@ def main():
                            args.gradient_calibration_batches * args.batch_size)
         sample_ids = clean_source_loader.dataset.trial_ids[:sample_count].tolist()
         fixture_recipe = {
+            "transport": transport_config,
             "source_checkpoint_sha256": source_fingerprint,
             "source_data_sha256": data_fingerprints["source"]["sha256"],
             "sample_ids": sample_ids,
@@ -804,6 +808,7 @@ def main():
             json.dumps(fixture_recipe, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         calibration_provenance = {
+            "transport": transport_config,
             "source_checkpoint_sha256": source_fingerprint,
             "source_data_sha256": data_fingerprints["source"]["sha256"],
             "alpha": args.alpha,
@@ -1178,6 +1183,7 @@ def main():
             "split_indices": target_data_metadata["split_indices"],
             "split_seed": target_data_metadata["split_seed"],
             "alignment_config": {
+                "transport": transport_config,
                 "alpha": args.alpha,
                 "ot_epsilon": args.ot_epsilon,
                 "sinkhorn_iters": args.sinkhorn_iters,

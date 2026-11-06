@@ -12,7 +12,7 @@ import torch
 
 from dataloader import NHPDataset, denormalize_velocity, get_nhp_dataloaders
 from decoder_models import compute_r2_score, compute_rmse
-from diffusion import LatentDiffusionModel, VPSDEScheduler
+from diffusion import LatentDiffusionModel, VPSDEScheduler, transport_configuration
 from mla_diagnostics import MLADiagnostics, variance_summary
 from mla_stabilization import source_trial_variance
 from alignment_noise_bank import AlignmentNoiseBank
@@ -86,7 +86,7 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.0,
                         help="MLA/OT mixture; default 0 retains historical MLA-only synthetic checks")
     parser.add_argument("--ot_epsilon", type=float, default=None)
-    parser.add_argument("--sinkhorn_iters", type=int, default=100)
+    parser.add_argument("--sinkhorn_iters", type=int, default=1000)
     parser.add_argument("--smooth_weight", type=float, default=0.0)
     parser.add_argument("--mla_t_min", type=float, default=None)
     parser.add_argument("--mla_t_max", type=float, default=None)
@@ -152,7 +152,8 @@ def main():
     )
     noise = checkpoint["diffusion_training"]
     scheduler = VPSDEScheduler(noise["beta_min"], noise["beta_max"], noise["T"], noise["t_min"])
-    ot_epsilon = args.ot_epsilon if args.ot_epsilon is not None else 0.1 * args.seq_len * checkpoint["latent_dim"]
+    ot_epsilon = args.ot_epsilon if args.ot_epsilon is not None else 0.01
+    transport_config = transport_configuration()
     probe_times = [t for t in (0.01, 0.05, 0.2, 0.5, 0.9) if scheduler.t_min <= t <= scheduler.T]
     if not probe_times:
         probe_times = [(scheduler.t_min + scheduler.T) / 2]
@@ -163,6 +164,7 @@ def main():
     if args.gradient_balance == "source_calibrated":
         calibration_path = Path(args.gradient_calibration_path or output / "source_gradient_calibration.json")
         calibration_provenance = {
+            "transport": transport_config,
             "source_checkpoint_sha256": source_hash,
             "source_data_sha256": data_hash,
             "calibration_seed": args.gradient_calibration_seed,
@@ -226,6 +228,7 @@ def main():
         "noise_bank_path": noise_bank_path if noise_bank is not None else None,
         "probe_noise_namespace": "independent_mla_diagnostics_fixture",
         "alpha": args.alpha, "ot_epsilon": ot_epsilon,
+        "transport": transport_config, "sinkhorn_iters": args.sinkhorn_iters,
         "gradient_balance": args.gradient_balance,
         "gradient_calibration": gradient_calibration,
         "gradient_calibration_path": str(calibration_path) if args.gradient_balance == "source_calibrated" else None,

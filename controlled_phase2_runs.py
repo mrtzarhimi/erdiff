@@ -237,6 +237,11 @@ def main():
     args = parser.parse_args()
 
     reference = load_reference(args.reference_run)
+    # Every protocol, including the synthetic launcher, must reject a reference
+    # from the former objective rather than silently relabeling it as a replay.
+    from diffusion import transport_configuration
+    if reference["resolved_config"].get("transport") != transport_configuration():
+        raise ValueError("Reference transport objective or POT version differs; generate a new reference run.")
     resolved = resolve_case_config(reference, args.protocol, args.case)
     if args.protocol == "synthetic" and resolved["resolved_config"].get("augment_target"):
         raise ValueError("Source-synthetic cases require unique clean adaptation trials; target augmentation is unsupported.")
@@ -279,7 +284,8 @@ def main():
                        "--weight_decay", str(config.get("weight_decay", 0.0)),
                        "--mla_variance_scope", str(config.get("mla_variance_scope", "full_train")),
                        "--seed", "42", "--split_seed", "42", "--shift_seed", "42",
-                       "--alpha", str(config.get("alpha", 0.0)), "--ot_epsilon", str(config.get("ot_epsilon", 31.2)),
+                       "--alpha", str(config.get("alpha", 0.0)), "--ot_epsilon", str(config.get("ot_epsilon", 0.01)),
+                       "--sinkhorn_iters", str(config.get("sinkhorn_iters", 1000)),
                        "--smooth_weight", str(config.get("smooth_weight", 0.0)),
                        "--gradient_balance", str(config.get("gradient_balance", "none")),
                        "--gradient_calibration_batches", str(config.get("gradient_calibration_batches", 3)),
@@ -325,7 +331,7 @@ def main():
                "--seq_len", str(config["seq_len"]), "--batch_size", str(config["batch_size"]),
                "--phase2_weight_decay", str(config.get("weight_decay", 0.0)),
                "--phase2_augment_mult", str(config.get("augment_mult", 3)),
-               "--phase2_sinkhorn_iters", str(config.get("sinkhorn_iters", 100)),
+               "--phase2_sinkhorn_iters", str(config.get("sinkhorn_iters", 1000)),
                "--phase2_gradient_calibration_batches", str(config.get("gradient_calibration_batches", 3)),
                "--phase2_alpha", str(config.get("alpha", 0.5)),
                "--phase2_mla_variance_weight", str(config.get("mla_variance_weight", 10.0)),

@@ -15,6 +15,21 @@ In brain-computer interface (BCI) decoding, raw neural population activities shi
 
 Evaluation uses saved deterministic trial partitions, go-cue-relative input windows, source-training velocity normalization, and test-only target metrics. `--split_seed` controls the partition independently of `--seed`, which controls model randomness. Checkpoints preserve their split indices and evaluation reuses them. Overlapping windows are kept in the same partition, and spike smoothing is applied within each trial window. Legacy checkpoints without split metadata must be regenerated.
 
+Phase 2 transport now follows the pinned 2023 author code: POT `ot.sinkhorn2`
+on `(squared_trajectory_distance + 1e-4) / max(cost)`, with default
+`--ot_epsilon 0.01` and `--sinkhorn_iters 1000`. Install the added dependency
+with `pip install -r requirements-transport.txt` before using it. No package
+installation was performed during this change. The objective returns transport
+cost without an explicit entropy term, and differentiates through both the
+solver and maximum normalization. It differs from the paper's written
+entropy-inclusive objective and from our former implementation.
+
+Do not reuse `--phase2_ot_epsilon 31.2` from previous commands: it was calibrated
+for unnormalized costs. Old gradient-calibration files and controlled reference
+manifests must be regenerated for this objective. New manifests record the
+objective and installed POT version; incomplete or mismatched references fail
+validation. Use fresh output directories and compare fixed budgets/splits.
+
 ---
 
 ## Project Structure

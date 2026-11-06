@@ -227,7 +227,7 @@ class VPSDEScheduler:
 
 
 # =====================================================================
-# 5. Losses: DSM (Phase 1), MLA (Phase 2), and Sinkhorn Divergence
+# 5. Losses: DSM (Phase 1), MLA (Phase 2), and author-code Sinkhorn cost
 # =====================================================================
 
 def dsm_loss(
@@ -287,40 +287,50 @@ def fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps):
     return residual_loss
 
 
+def transport_configuration():
+    """Identify the objective and installed POT backend in run/calibration metadata."""
+    import ot
+
+    return {
+        "objective": "author_2023_sinkhorn2_normalized_cost_v1",
+        "cost": "squared_euclidean_trajectory_plus_1e-4_divided_by_max",
+        "return_value": "transport_cost_without_entropy",
+        "gradient": "autograd_through_sinkhorn_and_cost_normalization",
+        "method": "sinkhorn",
+        "stop_threshold": 1e-9,
+        "pot_version": ot.__version__,
+    }
+
+
 def sinkhorn_loss(
     z_source: torch.Tensor,
     z_target: torch.Tensor,
-    epsilon: float = 0.1,
-    num_iters: int = 100,
+    epsilon: float = 0.01,
+    num_iters: int = 1000,
 ) -> torch.Tensor:
     """
-    Paper Eq. 27: squared trajectory cost plus entropy-regularized transport.
-    H(gamma) is the negative-entropy convention sum(gamma * log(gamma)).
-    This is regularized OT, not a debiased Sinkhorn divergence.
+    Match the pinned 2023 author implementation, MLA_Model.py:190-195.
+
+    POT solves for an entropy-regularized plan but sinkhorn2 returns only
+    <plan, normalized_cost>. This differs from the paper's explicit entropy
+    term. Gradients include both the iterations and cost.max() normalization.
     """
-    if epsilon <= 0 or num_iters < 1:
+    if not math.isfinite(epsilon) or epsilon <= 0 or num_iters < 1:
         raise ValueError("Sinkhorn epsilon and iteration count must be positive.")
+    import ot
+
     b_s = z_source.size(0)
     b_t = z_target.size(0)
-    x = z_source.reshape(b_s, -1).to(torch.float64)
-    y = z_target.reshape(b_t, -1).to(torch.float64)
-
-    cost = torch.cdist(x, y, p=2.0).square()
-    # Solve for the plan without tracking the iterations. At the optimum,
-    # the envelope theorem gives dL/dC = gamma for the full regularized value.
-    with torch.no_grad():
-        log_kernel = -cost.detach() / epsilon
-        log_mu = -torch.log(cost.new_tensor(float(b_s)))
-        log_nu = -torch.log(cost.new_tensor(float(b_t)))
-        log_u = torch.zeros(b_s, dtype=cost.dtype, device=cost.device)
-        log_v = torch.zeros(b_t, dtype=cost.dtype, device=cost.device)
-        for _ in range(num_iters):
-            log_u = log_mu - torch.logsumexp(log_kernel + log_v.unsqueeze(0), dim=1)
-            log_v = log_nu - torch.logsumexp(log_kernel + log_u.unsqueeze(1), dim=0)
-        log_gamma = log_u.unsqueeze(1) + log_kernel + log_v.unsqueeze(0)
-        gamma = torch.exp(log_gamma)
-    loss = torch.sum(gamma * cost) + epsilon * torch.sum(gamma * log_gamma)
-    return loss.to(z_target.dtype)
+    x = z_source.reshape(b_s, -1)
+    y = z_target.reshape(b_t, -1)
+    cost = ot.dist(x, y, metric="sqeuclidean") + 1e-4
+    cost = cost / cost.max()
+    source_mass = cost.new_full((b_s,), 1.0 / b_s)
+    target_mass = cost.new_full((b_t,), 1.0 / b_t)
+    return ot.sinkhorn2(
+        source_mass, target_mass, cost, reg=epsilon, method="sinkhorn",
+        numItermax=num_iters, stopThr=1e-9,
+    )
 
 
 def total_alignment_loss(
@@ -329,8 +339,8 @@ def total_alignment_loss(
     z_target: torch.Tensor,
     z_source: torch.Tensor,
     alpha: float = 0.5,
-    ot_epsilon: float = 0.1,
-    sinkhorn_iters: int = 100,
+    ot_epsilon: float = 0.01,
+    sinkhorn_iters: int = 1000,
     return_components: bool = False,
     mla_t_min=None,
     mla_t_max=None,
