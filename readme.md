@@ -63,6 +63,14 @@ instead of reporting NaN benchmark metrics. Existing failed checkpoints
 and results remain invalid; use fresh run directories and recalibrate for
 the new transport solver. These runtime checks have not been executed here.
 
+Diffusion training now defaults to `--diffusion_loss l1`, the element-mean
+absolute noise-prediction error used in the pinned 2023 author code. The old
+element-mean squared loss is available as `--diffusion_loss mse`.
+Checkpoints record the loss/reduction. Adopting L1 requires Phase 1 retraining;
+existing diffusion weights trained with MSE do not become L1-trained weights.
+Posterior sampling, the continuous VP schedule and model architecture remain
+separate local choices; this loss correction alone is not full reproduction.
+
 ---
 
 ## Project Structure

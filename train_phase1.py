@@ -42,6 +42,7 @@ def train_epoch_phase1(
     device: torch.device,
     kl_weight: float = 0.05,
     behavior_weight: float = 2.0,
+    diffusion_loss: str = "l1",
 ):
     vae.train()
     diffusion_model.train()
@@ -89,7 +90,7 @@ def train_epoch_phase1(
             mu_density, logvar_density = vae.encoder(spikes)
             z_0 = sample_latent_posterior(mu_density, logvar_density)
             vae.encoder.train()
-        loss_dm = dsm_loss(diffusion_model, scheduler, z_0)
+        loss_dm = dsm_loss(diffusion_model, scheduler, z_0, loss_type=diffusion_loss)
         loss_dm.backward()
         torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), max_norm=1.0)
         dm_optimizer.step()
@@ -182,6 +183,8 @@ def main():
     parser.add_argument("--behavior_weight", type=float, default=2.0, help="Velocity MSE loss weight")
     parser.add_argument("--posterior_logvar_mode", choices=("unclamped", "legacy_clamped"),
                         default="unclamped", help="Learn raw log variance; legacy_clamped reproduces the old [-5, 0] bounds")
+    parser.add_argument("--diffusion_loss", choices=("l1", "mse"), default="l1",
+                        help="Element-mean denoising loss; l1 matches the 2023 author loss")
     parser.add_argument("--inspect_data_only", action="store_true", help="Report source trial and velocity-window diagnostics without training")
     args = parser.parse_args()
 
@@ -298,6 +301,7 @@ def main():
             device=device,
             kl_weight=args.kl_weight,
             behavior_weight=args.behavior_weight,
+            diffusion_loss=args.diffusion_loss,
         )
 
         val_r2, val_rmse = evaluate_phase1(vae, val_loader, device)
@@ -334,6 +338,8 @@ def main():
                     "split_seed": velocity_stats["split_seed"],
                     "preprocessing": velocity_stats["preprocessing"],
                     "diffusion_training": {
+                        "denoising_loss": args.diffusion_loss,
+                        "denoising_reduction": "element_mean",
                         "latent_distribution": "posterior_sample",
                         "beta_min": scheduler.beta_min,
                         "beta_max": scheduler.beta_max,

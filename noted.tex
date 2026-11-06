@@ -560,6 +560,25 @@ posterior sampling scale, legacy and unclamped checkpoint restoration, and
 incompatible metadata. They are unrun by instruction; no training or
 typesetting was performed and no decoding improvement is claimed.
 
+\section{Author-code denoising loss}
+
+The pinned \path{model_functions/Diffusion.py}, lines 218--225, trains with
+element-mean absolute noise-prediction error. Phase 1 now defaults to
+\begin{equation}
+ L_{\mathrm{DM}}=\frac{1}{BLd}\sum_{b,\ell,j}
+       |\widehat\epsilon_{b\ell j}-\epsilon_{b\ell j}|.
+\end{equation}
+The previous element-mean MSE remains a named legacy option. These objectives
+are not related by a constant scale: their derivatives with respect to the
+predicted noise are respectively $\operatorname{sign}(\widehat\epsilon-
+\epsilon)/(BLd)$ (zero at equality under PyTorch's convention) and
+$2(\widehat\epsilon-\epsilon)/(BLd)$. A new Phase 1 run is required to obtain
+an L1-trained denoiser. Loss identity and reduction are saved in its checkpoint.
+The source latent sampling choice, continuous VP schedule and architecture
+are retained and still differ from parts of the historical author pipeline.
+Hand-derived value/gradient and duplicate-trial reduction checks are written
+but unrun.
+
 \begin{thebibliography}{9}\small
 \bibitem{erdiff}
 Y. Wang, Z. Wu, C. Li, and A. Wu.

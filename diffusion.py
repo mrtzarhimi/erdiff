@@ -235,20 +235,28 @@ def dsm_loss(
     diffusion_model: LatentDiffusionModel,
     scheduler: VPSDEScheduler,
     z_0: torch.Tensor,
+    loss_type: str = "l1",
+    noise=None,
+    timesteps=None,
 ) -> torch.Tensor:
     """
-    Phase 1: Denoising Score Matching (DSM) Loss for training the Diffusion Model.
+    Phase 1 author-code element-mean L1; MSE remains a named legacy option.
     """
     batch_size = z_0.size(0)
     # Uniformly sample continuous timesteps t in [0.001, T]
-    t = scheduler.sample_timesteps(batch_size, z_0.device)
-    eps = torch.randn_like(z_0)
+    t = scheduler.sample_timesteps(batch_size, z_0.device) if timesteps is None else timesteps
+    eps = torch.randn_like(z_0) if noise is None else noise
 
     z_t, _ = scheduler.add_noise(z_0, t, eps)
     eps_pred = diffusion_model(z_t, t)
 
-    # Standard DSM weighted squared error
-    loss = F.mse_loss(eps_pred, eps)
+    if loss_type == "l1":
+        loss = F.l1_loss(eps_pred, eps, reduction="mean")
+    elif loss_type == "mse":
+        loss = F.mse_loss(eps_pred, eps, reduction="mean")
+    else:
+        raise ValueError(f"Unknown diffusion training loss: {loss_type!r}")
+    require_finite("diffusion_training_loss", loss=loss)
     return loss
 
 
