@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from numerical_checks import require_finite
 
 
 # =====================================================================
@@ -274,16 +275,20 @@ def mla_loss(
 
 def fixed_noise_mla_loss(diffusion_model, scheduler, z_0_target, t, eps):
     """The production MLA objective with explicit timesteps and Gaussian noise."""
+    require_finite("mla_inputs", latent=z_0_target, timesteps=t, noise=eps)
     # Differentiable forward diffusion of target latents
     z_t, _ = scheduler.add_noise(z_0_target, t, eps)
+    require_finite("mla_noised_latents", noisy_latent=z_t)
 
     # Denoiser evaluates whether the spatio-temporal structure fits source dynamics
     eps_pred = diffusion_model(z_t, t)
+    require_finite("mla_denoiser_output", predicted_noise=eps_pred)
 
     # Eq. 26 uses a squared norm over each complete latent trajectory.
     # Unit w(t)^2 is used here; the paper leaves its weighting choice open.
     # The VP drift-divergence term is constant with respect to the read-in.
     residual_loss = (eps - eps_pred).square().flatten(start_dim=1).sum(dim=1).mean()
+    require_finite("mla_residual_loss", loss=residual_loss)
     return residual_loss
 
 
@@ -322,19 +327,25 @@ def sinkhorn_loss(
         raise ValueError("Sinkhorn epsilon and iteration count must be positive.")
     import ot
 
+    require_finite("transport_inputs", source_latent=z_source, target_latent=z_target)
     b_s = z_source.size(0)
     b_t = z_target.size(0)
     x = z_source.reshape(b_s, -1).to(torch.float64)
     y = z_target.reshape(b_t, -1).to(torch.float64)
     cost = ot.dist(x, y, metric="sqeuclidean") + 1e-4
+    require_finite("transport_squared_cost", cost=cost)
     cost = cost / cost.max()
+    require_finite("transport_normalized_cost", cost=cost)
     source_mass = cost.new_full((b_s,), 1.0 / b_s)
     target_mass = cost.new_full((b_t,), 1.0 / b_t)
     loss = ot.sinkhorn2(
         source_mass, target_mass, cost, reg=epsilon, method="sinkhorn_log",
         numItermax=num_iters, stopThr=1e-9,
     )
-    return loss.to(z_target.dtype)
+    require_finite("transport_solver_output", loss=loss)
+    result = loss.to(z_target.dtype)
+    require_finite("transport_output_cast", loss=result)
+    return result
 
 
 def total_alignment_loss(

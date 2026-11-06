@@ -339,6 +339,9 @@ def main():
                     log_component_gradients=args.log_component_gradients,
                     target_noise_domain=target_noise_domains[kind],
                     source_noise_domain=source_noise_domain,
+                    numerical_failure_path=run_dir / "phase2_numerical_failure.json",
+                    numerical_context={"epoch": epoch, "shift": kind, "variance_weight": weight,
+                                       "seed": args.seed, "split_seed": args.split_seed},
                 )
                 if args.frozen_check == "every_epoch":
                     denoiser_guard.verify_or_record_failure(

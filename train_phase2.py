@@ -17,6 +17,7 @@ from checkpoint_provenance import code_revision, file_fingerprint, file_sha256
 from phase2_freeze_guard import FrozenDiffusionGuard
 from alignment_noise_bank import AlignmentNoiseBank
 from neuron_input_mapping import NeuronInputMap
+from numerical_checks import NumericalGuard, checked_backward_step
 from alignment_gradient_diagnostics import (
     component_gradient_report,
     calibrate_source_gradient_scale,
@@ -279,6 +280,8 @@ def train_epoch_phase2(
     source_sampling_rng=None,
     target_noise_domain="target",
     source_noise_domain="source",
+    numerical_failure_path=None,
+    numerical_context=None,
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
@@ -310,9 +313,18 @@ def train_epoch_phase2(
     source_logvar = source_latents_bank.logvar
     source_trial_ids = source_latents_bank.trial_ids
     num_source_samples = source_mu.size(0)
+    numerical_guard = NumericalGuard(numerical_failure_path, numerical_context)
+    numerical_guard.check("source_posterior_bank", mu=source_mu, logvar=source_logvar)
+    numerical_guard.check("source_posterior_scale", logvar=source_logvar,
+                          std=torch.exp(0.5 * source_logvar))
 
-    for batch in target_loader:
+    for batch_index, batch in enumerate(target_loader, start=1):
+        numerical_guard.context.update({
+            "batch": batch_index,
+            "trial_ids": batch["trial_id"].detach().cpu().tolist(),
+        })
         target_spikes = batch["spikes"].to(device)
+        numerical_guard.check("target_input", spikes=target_spikes)
         batch_size = target_spikes.size(0)
         sample_exposures += batch_size
 
@@ -320,6 +332,9 @@ def train_epoch_phase2(
 
         # Algorithm 2 samples target latents from the encoder posterior.
         mu_t, logvar_t = vae.encoder(target_spikes)
+        numerical_guard.check("target_encoder_output", mu=mu_t, logvar=logvar_t)
+        numerical_guard.check("target_posterior_scale", logvar=logvar_t,
+                              std=torch.exp(0.5 * logvar_t))
         target_noise = source_noise = mla_noise = mla_times = None
         if noise_bank is None:
             z_target = sample_latent_posterior(mu_t, logvar_t)
@@ -327,6 +342,7 @@ def train_epoch_phase2(
             target_noise = noise_bank.get(target_noise_domain, batch["trial_id"], noise_replicate,
                                           mu_t.shape[1], mu_t.shape[2], device)
             z_target = sample_latent_posterior(mu_t, logvar_t, target_noise.posterior_eta)
+        numerical_guard.check("target_posterior_sample", latent=z_target)
 
         # 2. Sample matching batch of source latents for Sinkhorn regularizer
         if source_sampling_rng is None:
@@ -349,9 +365,11 @@ def train_epoch_phase2(
             mla_times = (torch.full_like(target_noise.uniform_time, mla_fixed_t) if mla_fixed_t is not None
                          else target_noise.uniform_time * (high - low) + low)
             mla_noise = target_noise.diffusion_eps
+        numerical_guard.check("source_posterior_sample", latent=z_source_batch)
 
         # 3. Compute paper MLA + regularized OT; smoothness is an optional variant.
-        loss_align, loss_mla, loss_ot = total_alignment_loss(
+        loss_align, loss_mla, loss_ot = numerical_guard.call(
+            total_alignment_loss,
             diffusion_model=diffusion_model,
             scheduler=scheduler,
             z_target=z_target,
@@ -402,9 +420,17 @@ def train_epoch_phase2(
             gradient_losses["smooth"] = loss_smooth
             gradient_coefficients["smooth"] = smooth_weight
 
+        numerical_guard.check("alignment_loss_components", **gradient_losses, total=loss)
+
         if log_component_gradients:
             report = component_gradient_report(
                 gradient_losses, tuple(vae.encoder.read_in.parameters()), gradient_coefficients
+            )
+            numerical_guard.check(
+                "component_read_in_gradient_norms",
+                **{name: loss.new_tensor(values["norm"])
+                   for name, values in report["components"].items()
+                   if values["norm"] is not None},
             )
             for name, values in report["components"].items():
                 totals = component_gradient_totals.setdefault(name, {"norm": 0.0, "weighted_norm": 0.0})
@@ -418,9 +444,9 @@ def train_epoch_phase2(
             component_gradient_batches += 1
 
         # 4. Update ONLY encoder.read_in
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(vae.encoder.read_in.parameters(), max_norm=1.0)
-        optimizer.step()
+        grad_norm = checked_backward_step(
+            loss, optimizer, vae.encoder.read_in.named_parameters(), numerical_guard
+        )
 
         total_loss += loss.item()
         total_mla += loss_mla.item()
@@ -676,6 +702,7 @@ def main():
         "alpha": args.alpha,
         "transport": transport_config,
         "posterior_config": posterior_config,
+        "numerical_failure_policy": "abort_before_optimizer_step_v1",
         "ot_epsilon": args.ot_epsilon,
         "sinkhorn_iters": args.sinkhorn_iters,
         "smooth_weight": args.smooth_weight,
@@ -996,6 +1023,12 @@ def main():
             source_sampling_rng=source_rng,
             target_noise_domain=target_noise_domain,
             source_noise_domain=source_noise_domain,
+            numerical_failure_path=os.path.join(args.save_dir, "phase2_numerical_failure.json"),
+            numerical_context={
+                "epoch": epoch, "source_checkpoint_sha256": source_fingerprint,
+                "target_session": os.path.basename(args.target_data_path),
+                "seed": args.seed, "split_seed": args.split_seed,
+            },
         )
         if args.frozen_check == "every_epoch":
             diffusion_guard.verify_or_record_failure(

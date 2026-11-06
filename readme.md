@@ -52,6 +52,17 @@ Unclamped variance and the mean-trajectory variance floor are separate:
 the former controls uncertainty in `q(z|x)`, the latter opposes collapse of
 posterior means. Neither change establishes recovery of decoding performance.
 
+Phase 2 now stops on nonfinite posterior parameters/scales/samples, MLA or
+transport intermediates, loss components, and read-in gradients. It rejects
+nonfinite gradient norms before the optimizer step. On failure the training
+entry point writes `phase2_numerical_failure.json` with the stage, epoch,
+batch, trial IDs, and affected tensor shapes/dtypes/ranges; it raises instead
+of saving a completed aligned checkpoint. Synthetic runs write the same
+report in their run directory. Both evaluators reject nonfinite predictions
+instead of reporting NaN benchmark metrics. Existing failed checkpoints
+and results remain invalid; use fresh run directories and recalibrate for
+the new transport solver. These runtime checks have not been executed here.
+
 ---
 
 ## Project Structure

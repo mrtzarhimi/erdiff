@@ -498,6 +498,27 @@ method and precision are recorded in transport provenance, invalidating old
 calibration artifacts. CPU and optional CUDA regression checks are written
 for separated float32 domains, but remain unrun.
 
+\subsection{Stopping at the first nonfinite operation}
+
+Alignment now checks the source posterior bank and scales, target input,
+encoder means and log variances, posterior scales and samples, MLA inputs,
+noised latents and denoiser outputs, transport inputs and costs, and each
+configured loss. When component-gradient logging is enabled, nonfinite
+component norms also stop the run. Before any optimizer step, every available
+read-in gradient must be finite and clipping uses
+\texttt{error\_if\_nonfinite=True}; updated read-in parameters are checked
+as well. A failure aborts the run instead of silently skipping batches or
+changing the objective, and prevents the normal completed-checkpoint path.
+
+The JSON failure record identifies the stage, epoch, batch and trial IDs,
+plus tensor shapes, dtypes, devices, nonfinite counts and finite ranges.
+No target behavior labels enter this check. Both evaluation entry points
+reject nonfinite predictions rather than treating NaN metrics as a benchmark.
+The historical failed outputs remain invalid; this revision does not
+repair their read-ins. Checks for a finite forward loss with an infinite
+backward derivative, optimizer non-mutation on failure, and corrupted
+evaluation read-ins are written but unrun.
+
 \section{Learned posterior variance without output clamps}
 
 The author VAE computes log variance with a linear head without bounding

@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from dataloader import denormalize_velocity, get_nhp_dataloaders
 from vae import SequentialVAE, posterior_logvar_mode_from_checkpoint
+from numerical_checks import require_finite
 from decoder_models import compute_r2_score, compute_rmse, compute_accuracy
 from neuron_input_mapping import apply_mapping_to_loader, mapping_from_checkpoint
 
@@ -54,6 +55,7 @@ def run_inference(vae: SequentialVAE, loader, device: torch.device):
         mu, _ = vae.encoder(spikes)
         # 2. Map latents to predicted velocity
         pred_vel = vae.behavior_decoder(mu)
+        require_finite("evaluation_predictions", latent=mu, prediction=pred_vel, target=velocity)
 
         latents_list.append(mu.cpu())
         pred_vel_list.append(pred_vel.cpu())
