@@ -3,6 +3,12 @@
 Diffusion model implementation
 """
 
+import os
+
+# Phase 2 uses POT with PyTorch tensors. Prevent POT from initializing its
+# optional JAX backend, which can create a second GPU context during dispatch.
+os.environ.setdefault("POT_BACKEND_DISABLE_JAX", "1")
+
 import math
 import torch
 import torch.nn as nn
