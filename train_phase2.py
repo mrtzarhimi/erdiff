@@ -290,6 +290,7 @@ def train_epoch_phase2(
     numerical_failure_path=None,
     numerical_context=None,
     alignment_objective="author_2023",
+    paper_batch_strategy="balanced_minibatch",
 ):
     """
     Phase 2: Maximum Likelihood Alignment (Algorithm 2).
@@ -356,15 +357,21 @@ def train_epoch_phase2(
         numerical_guard.check("target_posterior_sample", latent=z_target)
 
         # 2. Sample matching batch of source latents for Sinkhorn regularizer
-        if source_sampling_rng is None:
+        if paper_batch_strategy == "paper_full_domain":
+            source_indices_cpu = torch.arange(num_source_samples)
+            perm = source_indices_cpu.to(device)
+            selected_source_ids = source_trial_ids
+        elif paper_batch_strategy == "balanced_minibatch" and source_sampling_rng is None:
             perm = torch.randperm(num_source_samples, device=device)[:batch_size]
             selected_source_ids = source_trial_ids[perm.detach().cpu()]
-        else:
+        elif paper_batch_strategy == "balanced_minibatch":
             source_indices_cpu = torch.randperm(
                 num_source_samples, generator=source_sampling_rng
             )[:batch_size]
             perm = source_indices_cpu.to(device)
             selected_source_ids = source_trial_ids[source_indices_cpu]
+        else:
+            raise ValueError(f"Unknown Phase 2 batch strategy: {paper_batch_strategy!r}")
         if noise_bank is None:
             z_source_batch = sample_latent_posterior(source_mu[perm], source_logvar[perm])
         else:
@@ -519,6 +526,9 @@ def main():
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Output directory")
     parser.add_argument("--seq_len", type=int, default=39, help="Number of time bins per trial")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--paper_batch_strategy", choices=("balanced_minibatch", "paper_full_domain"),
+                        default="balanced_minibatch",
+                        help="Phase 2 batching: current balanced minibatches or one full source/target training-domain batch per epoch")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for target read-in probing")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Optional read-in weight decay variant")
     parser.add_argument("--epochs", type=int, default=150, help="Alignment epochs")
@@ -689,15 +699,22 @@ def main():
     )
     clean_source_loader = clean_training_view(src_train_loader, args.batch_size)
     clean_target_loader = clean_training_view(tgt_train_loader, args.batch_size)
-    from phase2_sampling import make_alignment_loader
+    from phase2_sampling import make_alignment_loader_for_strategy
     optimization_dataset = tgt_train_loader.dataset if args.augment_target else clean_target_loader.dataset
-    alignment_loader = make_alignment_loader(optimization_dataset, args.batch_size, args.seed)
-    batch_count = len(alignment_loader)
-    small_batch, extra = divmod(len(optimization_dataset), batch_count)
-    print(
-        f"Adaptation batches: {batch_count}, sizes {small_batch}–{small_batch + bool(extra)} | "
-        f"all {len(optimization_dataset)} samples visited once per shuffled epoch"
+    alignment_loader = make_alignment_loader_for_strategy(
+        optimization_dataset, args.batch_size, args.seed, args.paper_batch_strategy
     )
+    batch_count = len(alignment_loader)
+    if args.paper_batch_strategy == "paper_full_domain":
+        batch_sizes = [len(optimization_dataset)]
+    else:
+        num_largest = len(optimization_dataset) % batch_count
+        batch_sizes = ([largest_batch] * batch_count if num_largest == 0 else
+                       [len(optimization_dataset) // batch_count + 1] * num_largest +
+                       [len(optimization_dataset) // batch_count] * (batch_count - num_largest))
+    print(f"Phase 2 batch strategy: {args.paper_batch_strategy} | "
+          f"adaptation batches: {batch_count}, sizes {min(batch_sizes)}–{max(batch_sizes)} | "
+          f"all {len(optimization_dataset)} adaptation samples visited once per epoch")
 
     # 2. Restore Source Models from Phase 1
     latent_dim = checkpoint["latent_dim"]
@@ -754,7 +771,9 @@ def main():
         "optimizer_betas": [0.9, 0.999],
         "optimizer_eps": 1e-8,
         "gradient_clip_norm": 1.0,
-        "batch_sampler": "seeded_balanced_shuffle",
+        "paper_batch_strategy": args.paper_batch_strategy,
+        "batch_sampler": ("paper_full_domain" if args.paper_batch_strategy == "paper_full_domain"
+                          else "seeded_balanced_shuffle"),
         "source_sampling_seed": derive_seed(args.seed, "source-bank-trial-selection"),
         "alignment_batch_seed": derive_seed(args.seed, "alignment-batch-order"),
         "diffusion_beta_min": noise_config["beta_min"],
@@ -1056,6 +1075,7 @@ def main():
             target_noise_domain=target_noise_domain,
             source_noise_domain=source_noise_domain,
             alignment_objective=args.alignment_objective,
+            paper_batch_strategy=args.paper_batch_strategy,
             numerical_failure_path=os.path.join(args.save_dir, "phase2_numerical_failure.json"),
             numerical_context={
                 "epoch": epoch, "source_checkpoint_sha256": source_fingerprint,
@@ -1283,7 +1303,9 @@ def main():
                 "model_input_width": model_input_width,
                 "seed": args.seed,
                 "batch_size": args.batch_size,
-                "batch_sampler": "seeded_balanced_shuffle",
+                "paper_batch_strategy": args.paper_batch_strategy,
+                "batch_sampler": ("paper_full_domain" if args.paper_batch_strategy == "paper_full_domain"
+                                  else "seeded_balanced_shuffle"),
                 "optimizer": "Adam",
                 "alignment_noise_mode": args.alignment_noise_mode,
                 "noise_seed": args.noise_seed,

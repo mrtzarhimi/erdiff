@@ -116,6 +116,10 @@ def main():
     parser.add_argument("--latent_dim", type=int, default=8, help="Latent dimension")
     parser.add_argument("--hidden_dim", type=int, default=32, help="GRU hidden dimension")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--phase2_paper_batch_strategy",
+                        choices=("balanced_minibatch", "paper_full_domain"),
+                        default="balanced_minibatch",
+                        help="Phase 2 batch updates: balanced minibatches or one full domain batch per epoch")
     parser.add_argument("--phase1_epochs", type=int, default=200, help="Epochs for Phase 1 source training")
     parser.add_argument("--phase2_epochs", type=int, default=150, help="Epochs for Phase 2 alignment per day")
     parser.add_argument("--phase2_lr", type=float, default=0.001, help="Target read-in learning rate")
@@ -249,6 +253,7 @@ def main():
             "--save_dir", target_run_root,
             "--seq_len", str(args.seq_len),
             "--batch_size", str(args.batch_size),
+            "--paper_batch_strategy", args.phase2_paper_batch_strategy,
             "--lr", str(args.phase2_lr),
             "--weight_decay", str(args.phase2_weight_decay),
             "--epochs", str(args.phase2_epochs),
