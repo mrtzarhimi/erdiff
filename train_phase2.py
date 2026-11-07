@@ -709,7 +709,7 @@ def main():
         batch_sizes = [len(optimization_dataset)]
     else:
         num_largest = len(optimization_dataset) % batch_count
-        batch_sizes = ([largest_batch] * batch_count if num_largest == 0 else
+        batch_sizes = ([len(optimization_dataset) // batch_count] * batch_count if num_largest == 0 else
                        [len(optimization_dataset) // batch_count + 1] * num_largest +
                        [len(optimization_dataset) // batch_count] * (batch_count - num_largest))
     print(f"Phase 2 batch strategy: {args.paper_batch_strategy} | "
